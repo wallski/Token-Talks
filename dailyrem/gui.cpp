@@ -1,0 +1,663 @@
+#include "gui.h"
+#include "vendor/imgui/imgui.h"
+#include "vendor/imgui/imgui_impl_win32.h"
+#include "vendor/imgui/imgui_impl_dx11.h"
+#include "discord_client.h"
+#include "account.h"
+#include <d3d11.h>
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "dxguid.lib")
+#include <tchar.h>
+#include <vector>
+#include <mutex>
+#include <map>
+#include <commdlg.h>
+#include <fstream>
+#define STB_IMAGE_IMPLEMENTATION
+#include "vendor/stb_image.h"
+#include "vendor/nlohmann/json.hpp"
+
+// Forward declare message handler from imgui_impl_win32.cpp
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// D3D11 data
+static ID3D11Device* g_pd3dDevice = nullptr;
+static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
+static IDXGISwapChain* g_pSwapChain = nullptr;
+static UINT g_ResizeWidth = 0, g_ResizeHeight = 0;
+static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
+
+bool CreateDeviceD3D(HWND hWnd);
+void CleanupDeviceD3D();
+void CreateRenderTarget();
+void CleanupRenderTarget();
+
+static DiscordClient gc;
+static std::vector<DiscordGuild> g_Guilds;
+static std::vector<DiscordChannel> g_Channels;
+static std::vector<DiscordMessage> g_Messages;
+static std::string g_SelectedGuildId;
+static std::string g_SelectedChannelId;
+static std::mutex g_DataMutex;
+static std::mutex g_ChatMutex;
+static char g_InputBuffer[1024] = "";
+
+struct AppSettings {
+    int theme = 0;
+};
+static AppSettings g_Settings;
+static bool g_ShowSettings = false;
+static std::string g_EditingMessageId = "";
+static char g_EditBuffer[1024] = "";
+
+void LoadSettings() {
+    std::ifstream file("settings.json");
+    if (file) {
+        std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        try {
+            auto j = nlohmann::json::parse(content);
+            if (j.contains("theme")) g_Settings.theme = j["theme"].get<int>();
+        } catch(...) {}
+    }
+}
+
+void SaveSettings() {
+    nlohmann::json j;
+    j["theme"] = g_Settings.theme;
+    std::ofstream file("settings.json");
+    file << j.dump(4);
+}
+
+void ApplyTheme(int theme) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    if (theme == 3) {
+        ImGui::StyleColorsLight();
+        style.Colors[ImGuiCol_WindowBg] = ImVec4(0.9f, 0.9f, 0.9f, 1.0f);
+        style.Colors[ImGuiCol_ChildBg] = ImVec4(0.95f, 0.95f, 0.95f, 1.0f);
+        style.Colors[ImGuiCol_Button] = ImVec4(0.7f, 0.7f, 0.7f, 1.00f);
+        style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.6f, 0.6f, 0.6f, 1.00f);
+        style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.5f, 0.5f, 0.5f, 1.00f);
+        style.Colors[ImGuiCol_Text] = ImVec4(0.1f, 0.1f, 0.1f, 1.0f);
+    } else {
+        ImGui::StyleColorsDark();
+        style.Colors[ImGuiCol_Text] = ImVec4(0.9f, 0.9f, 0.9f, 1.0f);
+        if (theme == 0) { // Blurple
+            style.Colors[ImGuiCol_WindowBg] = ImVec4(0.18f, 0.19f, 0.22f, 1.00f);
+            style.Colors[ImGuiCol_ChildBg] = ImVec4(0.19f, 0.20f, 0.23f, 1.0f);
+            style.Colors[ImGuiCol_Button] = ImVec4(0.35f, 0.40f, 0.94f, 1.00f);
+            style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.31f, 0.35f, 0.81f, 1.00f);
+            style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.24f, 0.26f, 0.65f, 1.00f);
+        } else if (theme == 1) { // Midnight
+            style.Colors[ImGuiCol_WindowBg] = ImVec4(0.04f, 0.04f, 0.04f, 1.00f);
+            style.Colors[ImGuiCol_ChildBg] = ImVec4(0.06f, 0.06f, 0.06f, 1.0f);
+            style.Colors[ImGuiCol_Button] = ImVec4(0.2f, 0.2f, 0.2f, 1.00f);
+            style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.3f, 0.3f, 0.3f, 1.00f);
+            style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.4f, 0.4f, 0.4f, 1.00f);
+        } else if (theme == 2) { // Ruby
+            style.Colors[ImGuiCol_WindowBg] = ImVec4(0.1f, 0.05f, 0.05f, 1.00f);
+            style.Colors[ImGuiCol_ChildBg] = ImVec4(0.12f, 0.06f, 0.06f, 1.0f);
+            style.Colors[ImGuiCol_Button] = ImVec4(0.6f, 0.1f, 0.1f, 1.00f);
+            style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.7f, 0.15f, 0.15f, 1.00f);
+            style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.8f, 0.2f, 0.2f, 1.00f);
+        }
+    }
+    
+    style.FramePadding = ImVec2(10, 8);
+    style.ItemSpacing = ImVec2(10, 10);
+    style.FrameRounding = 6.0f;
+    style.WindowRounding = 8.0f;
+    style.GrabRounding = 6.0f;
+    style.ChildRounding = 6.0f;
+    style.ScrollbarRounding = 6.0f;
+}
+
+struct HTTPTexture {
+    ID3D11ShaderResourceView* view = nullptr;
+    int width = 0;
+    int height = 0;
+};
+static std::map<std::string, HTTPTexture> g_Textures;
+static std::mutex g_TextureMutex;
+
+void RequestTexture(const std::string& url) {
+    if (url.empty()) return;
+    std::thread([url]() {
+        auto bytes = gc.DownloadFile(url);
+        if (bytes.empty()) return;
+        int w, h, n;
+        unsigned char* data = stbi_load_from_memory(bytes.data(), bytes.size(), &w, &h, &n, 4);
+        if (!data) return;
+        
+        D3D11_TEXTURE2D_DESC desc;
+        ZeroMemory(&desc, sizeof(desc));
+        desc.Width = w;
+        desc.Height = h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA subResource;
+        subResource.pSysMem = data;
+        subResource.SysMemPitch = desc.Width * 4;
+        subResource.SysMemSlicePitch = 0;
+
+        ID3D11Texture2D* pTexture = nullptr;
+        ID3D11ShaderResourceView* pSrv = nullptr;
+
+        if (g_pd3dDevice->CreateTexture2D(&desc, &subResource, &pTexture) == S_OK) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
+            ZeroMemory(&srvDesc, sizeof(srvDesc));
+            srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = desc.MipLevels;
+            g_pd3dDevice->CreateShaderResourceView(pTexture, &srvDesc, &pSrv);
+            pTexture->Release();
+        }
+        stbi_image_free(data);
+
+        if (pSrv) {
+            std::lock_guard<std::mutex> lock(g_TextureMutex);
+            g_Textures[url] = { pSrv, w, h };
+        }
+    }).detach();
+}
+
+std::string OpenMediaFileDialog() {
+    OPENFILENAMEA ofn;
+    char szFile[260] = { 0 };
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "Media\0*.PNG;*.JPG;*.JPEG;*.GIF;*.MP4\0All\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+    if (GetOpenFileNameA(&ofn) == TRUE) {
+        return szFile;
+    }
+    return "";
+}
+
+static std::vector<Account> g_Accounts;
+static bool g_IsLoggedIn = false;
+static std::string g_TokenError = "";
+
+// Helpers
+void LoadAccountsGUI() { LoadAccounts(g_Accounts); }
+
+void RefreshGuilds() {
+    auto guilds = gc.FetchGuilds();
+    std::lock_guard<std::mutex> lock(g_DataMutex);
+    g_Guilds = guilds;
+    g_Channels.clear();
+    g_SelectedGuildId = "";
+    g_SelectedChannelId = "";
+}
+
+void RefreshChannels(const std::string& guildId) {
+    auto channels = gc.FetchChannels(guildId);
+    std::lock_guard<std::mutex> lock(g_DataMutex);
+    g_SelectedGuildId = guildId;
+    g_Channels = channels;
+    g_SelectedChannelId = "";
+}
+
+void RefreshMessages(const std::string& channelId) {
+    auto msgs = gc.FetchMessages(channelId);
+    std::lock_guard<std::mutex> lock(g_DataMutex);
+    g_SelectedChannelId = channelId;
+    {
+        std::lock_guard<std::mutex> chatLock(g_ChatMutex);
+        g_Messages = msgs;
+    }
+}
+
+void OnDiscordMessage(const DiscordMessage& msg) {
+    std::lock_guard<std::mutex> lock(g_ChatMutex);
+    if (!g_SelectedChannelId.empty()) { // Could filter by channel later
+        g_Messages.push_back(msg);
+    }
+}
+
+void DrawDashboard() {
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->Pos);
+    ImGui::SetNextWindowSize(ImGui::GetMainViewport()->Size);
+    ImGui::Begin("Dashboard", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+    
+    ImVec2 winSize = ImGui::GetWindowSize();
+    
+    // Centered Title
+    ImVec2 subSize = ImGui::CalcTextSize("welcome to");
+    ImGui::SetCursorPos(ImVec2(winSize.x * 0.5f - subSize.x * 0.5f, winSize.y * 0.2f));
+    ImGui::TextDisabled("welcome to");
+    
+    ImGui::SetWindowFontScale(2.5f);
+    ImVec2 mainTitleSize = ImGui::CalcTextSize("Token-Talks");
+    ImGui::SetCursorPosX(winSize.x * 0.5f - mainTitleSize.x * 0.5f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 5);
+    ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.94f, 1.0f), "Token-Talks");
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Dummy(ImVec2(0, 10));
+
+    ImGui::SetCursorPosX(winSize.x * 0.5f - 150);
+    ImGui::BeginChild("AccountList", ImVec2(300, 200), true);
+    for (size_t i = 0; i < g_Accounts.size(); ++i) {
+        ImGui::PushID((int)i);
+        if (ImGui::Button(g_Accounts[i].name.c_str(), ImVec2(ImGui::GetContentRegionAvail().x - 35, 35))) {
+            gc.SetToken(g_Accounts[i].token);
+            gc.SetOnMessageCallback(OnDiscordMessage);
+            gc.Connect();
+            g_IsLoggedIn = true;
+            std::thread([]() { RefreshGuilds(); }).detach();
+        }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
+        if (ImGui::Button("X", ImVec2(30, 35))) {
+            g_Accounts.erase(g_Accounts.begin() + i);
+            SaveAccounts(g_Accounts);
+            LoadAccountsGUI();
+            ImGui::PopStyleColor(2);
+            ImGui::PopID();
+            break;
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    ImGui::SetCursorPosX(winSize.x * 0.5f - 150);
+    if (ImGui::Button("Refresh List", ImVec2(300, 35))) {
+        LoadAccountsGUI();
+    }
+    
+    static char newName[128] = "";
+    static char newToken[256] = "";
+    ImGui::SetCursorPosX(winSize.x * 0.5f - 150);
+    ImGui::Dummy(ImVec2(0, 20));
+    ImGui::SetCursorPosX(winSize.x * 0.5f - 150);
+    ImGui::Text("Add New Account:");
+    ImGui::SetCursorPosX(winSize.x * 0.5f - 150);
+    ImGui::PushItemWidth(300);
+    ImGui::InputTextWithHint("##Name", "Display Name", newName, sizeof(newName));
+    ImGui::SetCursorPosX(winSize.x * 0.5f - 150);
+    ImGui::InputTextWithHint("##Token", "Discord Token", newToken, sizeof(newToken), ImGuiInputTextFlags_Password);
+    ImGui::PopItemWidth();
+    
+    ImGui::SetCursorPosX(winSize.x * 0.5f - 150);
+    if (ImGui::Button("Add Account", ImVec2(300, 35))) {
+        if (strlen(newName) > 0 && strlen(newToken) > 0) {
+            if (DiscordClient::ValidateToken(newToken)) {
+                Account acc = { newName, newToken };
+                g_Accounts.push_back(acc);
+                SaveAccounts(g_Accounts);
+                LoadAccountsGUI();
+                memset(newName, 0, sizeof(newName));
+                memset(newToken, 0, sizeof(newToken));
+                g_TokenError = "";
+            } else {
+                g_TokenError = "Invalid Token provided!";
+            }
+        }
+    }
+
+    if (!g_TokenError.empty()) {
+        ImGui::SetCursorPosX(winSize.x * 0.5f - 150);
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", g_TokenError.c_str());
+    }
+
+    ImGui::End();
+}
+
+void DrawMainApp() {
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->Pos);
+    ImGui::SetNextWindowSize(ImGui::GetMainViewport()->Size);
+    ImGui::Begin("MainApp", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+
+    ImGui::Text("Logged in as User ID: %s", gc.GetUserId().c_str());
+    ImGui::SameLine(ImGui::GetWindowWidth() - 200);
+    if (ImGui::Button("Settings", ImVec2(90, 0))) {
+        g_ShowSettings = !g_ShowSettings;
+    }
+    ImGui::SameLine(ImGui::GetWindowWidth() - 100);
+    if (ImGui::Button("Logout", ImVec2(80, 0))) {
+        std::thread([]() { gc.Disconnect(); }).detach();
+        g_IsLoggedIn = false;
+        g_ShowSettings = false; // Reset on logout
+    }
+    ImGui::Separator();
+    
+    if (g_ShowSettings) {
+        ImGui::BeginChild("SettingsPane", ImVec2(0, 0), true);
+        ImGui::SetWindowFontScale(1.5f);
+        ImGui::Text("Client Settings");
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::Separator();
+        
+        ImGui::Dummy(ImVec2(0, 10));
+        ImGui::Text("Interface Theme");
+        const char* themes[] = { "Modern Blurple", "Midnight Stealth", "Ruby Crimson", "Classic Light" };
+        ImGui::PushItemWidth(300);
+        if (ImGui::Combo("##ThemeSelect", &g_Settings.theme, themes, IM_ARRAYSIZE(themes))) {
+            ApplyTheme(g_Settings.theme);
+            SaveSettings();
+        }
+        ImGui::PopItemWidth();
+        ImGui::EndChild();
+        ImGui::End();
+        return;
+    }
+
+    // Left Panel (Servers)
+    ImGui::BeginChild("Servers", ImVec2(200, 0), true);
+    ImGui::Text("Servers");
+    ImGui::Separator();
+    {
+        std::lock_guard<std::mutex> lock(g_DataMutex);
+        for (const auto& g : g_Guilds) {
+            bool selected = (g.id == g_SelectedGuildId);
+            if (ImGui::Selectable(g.name.c_str(), selected)) {
+                std::thread([g]() { RefreshChannels(g.id); }).detach();
+            }
+        }
+    }
+    ImGui::EndChild();
+    
+    ImGui::SameLine();
+
+    // Middle Panel (Channels)
+    ImGui::BeginChild("Channels", ImVec2(200, 0), true);
+    ImGui::Text("Channels");
+    ImGui::Separator();
+    {
+        std::lock_guard<std::mutex> lock(g_DataMutex);
+        for (const auto& c : g_Channels) {
+            bool selected = (c.id == g_SelectedChannelId);
+            if (ImGui::Selectable(c.name.c_str(), selected)) {
+                std::thread([c]() { RefreshMessages(c.id); }).detach();
+            }
+        }
+    }
+    ImGui::EndChild();
+    
+    ImGui::SameLine();
+
+    // Right Panel (Chat)
+    ImGui::BeginChild("Chat", ImVec2(0, 0), true);
+    ImGui::Text("Chat: %s", g_SelectedChannelId.c_str());
+    ImGui::Separator();
+
+    ImGui::BeginChild("MessagesScroll", ImVec2(0, -45), true);
+    {
+        std::lock_guard<std::mutex> lock(g_ChatMutex);
+        for (const auto& m : g_Messages) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.24f, 0.25f, 0.29f, 1.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+            
+            ImGui::BeginChild(("msg_" + m.id).c_str(), ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_AlwaysAutoResize);
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", m.author.c_str());
+            ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 10);
+            ImGui::Text("%s", m.content.c_str());
+            ImGui::PopTextWrapPos();
+
+            if (!m.attachment_url.empty()) {
+                ImGui::Dummy(ImVec2(0, 5));
+                HTTPTexture localTex = {nullptr, 0, 0};
+                bool needsLoad = false;
+                {
+                    std::lock_guard<std::mutex> texLock(g_TextureMutex);
+                    if (g_Textures.count(m.attachment_url) == 0) {
+                        g_Textures[m.attachment_url] = { nullptr, 0, 0 }; // Mark loading
+                        needsLoad = true;
+                    } else {
+                        localTex = g_Textures[m.attachment_url];
+                    }
+                }
+                if (needsLoad) {
+                    RequestTexture(m.attachment_url); // Safe, outside lock
+                }
+                if (localTex.view) {
+                    float drawH = 200.0f;
+                    float drawW = localTex.width * (drawH / localTex.height);
+                    if (drawW > ImGui::GetContentRegionAvail().x) {
+                         drawW = ImGui::GetContentRegionAvail().x;
+                         drawH = localTex.height * (drawW / localTex.width);
+                    }
+                    ImGui::Image((void*)localTex.view, ImVec2(drawW, drawH));
+                } else {
+                    ImGui::TextDisabled("[ Loading Media... ]");
+                }
+            }
+
+            ImGui::EndChild();
+            
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+            
+            if (m.author_id == gc.GetUserId() && !m.id.empty()) {
+                if (ImGui::BeginPopupContextItem(("CTX_" + m.id).c_str())) {
+                    if (ImGui::MenuItem("Edit Message")) {
+                        g_EditingMessageId = m.id;
+                        strncpy_s(g_EditBuffer, sizeof(g_EditBuffer), m.content.c_str(), _TRUNCATE);
+                    }
+                    if (ImGui::MenuItem("Delete Message")) {
+                        std::string cid = g_SelectedChannelId;
+                        std::string mid = m.id;
+                        std::thread([cid, mid]() {
+                            gc.DeleteMessage(cid, mid);
+                            RefreshMessages(cid);
+                        }).detach();
+                    }
+                    ImGui::EndPopup();
+                }
+            }
+
+            if (g_EditingMessageId == m.id) {
+                ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 60);
+                ImGui::InputText(("##Edit" + m.id).c_str(), g_EditBuffer, sizeof(g_EditBuffer));
+                ImGui::PopItemWidth();
+                ImGui::SameLine();
+                if (ImGui::Button("Save", ImVec2(50, 0))) {
+                    std::string cid = g_SelectedChannelId;
+                    std::string mid = m.id;
+                    std::string msg = g_EditBuffer;
+                    std::thread([cid, mid, msg]() {
+                        gc.EditMessage(cid, mid, msg);
+                        RefreshMessages(cid);
+                    }).detach();
+                    g_EditingMessageId = "";
+                }
+            }
+
+            ImGui::Dummy(ImVec2(0, 8));
+        }
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+            ImGui::SetScrollHereY(1.0f);
+    }
+    ImGui::EndChild();
+    
+    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 100);
+
+    if (ImGui::Button("+", ImVec2(30, 24))) {
+        std::string path = OpenMediaFileDialog();
+        if (!path.empty() && !g_SelectedChannelId.empty()) {
+            std::string chId = g_SelectedChannelId;
+            std::thread([chId, path]() {
+                gc.SendAttachment(chId, path);
+                RefreshMessages(chId);
+            }).detach();
+        }
+    }
+    ImGui::SameLine();
+
+    if (ImGui::InputText("##Send", g_InputBuffer, sizeof(g_InputBuffer), ImGuiInputTextFlags_EnterReturnsTrue)) {
+        if (strlen(g_InputBuffer) > 0 && !g_SelectedChannelId.empty()) {
+            std::string content = g_InputBuffer;
+            std::string chId = g_SelectedChannelId;
+            memset(g_InputBuffer, 0, sizeof(g_InputBuffer));
+            std::thread([chId, content]() {
+                gc.SendDiscordMessage(chId, content);
+                RefreshMessages(chId);
+            }).detach();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Send")) {
+        if (strlen(g_InputBuffer) > 0 && !g_SelectedChannelId.empty()) {
+            std::string content = g_InputBuffer;
+            std::string chId = g_SelectedChannelId;
+            memset(g_InputBuffer, 0, sizeof(g_InputBuffer));
+            std::thread([chId, content]() {
+                gc.SendDiscordMessage(chId, content);
+                RefreshMessages(chId);
+            }).detach();
+        }
+    }
+    ImGui::PopItemWidth();
+    
+    ImGui::EndChild();
+    
+    ImGui::End();
+}
+
+LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
+    switch (msg) {
+    case WM_SIZE:
+        if (wParam == SIZE_MINIMIZED) return 0;
+        g_ResizeWidth = (UINT)LOWORD(lParam); g_ResizeHeight = (UINT)HIWORD(lParam);
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+int RunGUI() {
+    WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, _T("TokenTalks"), nullptr };
+    ::RegisterClassEx(&wc);
+    HWND hwnd = ::CreateWindow(wc.lpszClassName, _T("Token-Talks"), WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, nullptr, nullptr, wc.hInstance, nullptr);
+
+    if (!CreateDeviceD3D(hwnd)) {
+        CleanupDeviceD3D();
+        ::UnregisterClass(wc.lpszClassName, wc.hInstance);
+        return 1;
+    }
+
+    ::ShowWindow(hwnd, SW_SHOWDEFAULT);
+    ::UpdateWindow(hwnd);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    LoadSettings();
+    ApplyTheme(g_Settings.theme);
+
+    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    LoadAccountsGUI();
+
+    bool done = false;
+    while (!done) {
+        MSG msg;
+        while (::PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
+            ::TranslateMessage(&msg);
+            ::DispatchMessage(&msg);
+            if (msg.message == WM_QUIT) done = true;
+        }
+        if (done) break;
+
+        if (g_ResizeWidth != 0 && g_ResizeHeight != 0) {
+            CleanupRenderTarget();
+            g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
+            g_ResizeWidth = g_ResizeHeight = 0;
+            CreateRenderTarget();
+        }
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        if (!g_IsLoggedIn) { DrawDashboard(); }
+        else { DrawMainApp(); }
+
+        ImGui::Render();
+        const float clear_color_with_alpha[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        g_pSwapChain->Present(1, 0);
+    }
+
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+
+    CleanupDeviceD3D();
+    ::DestroyWindow(hwnd);
+    ::UnregisterClass(wc.lpszClassName, wc.hInstance);
+
+    return 0;
+}
+
+bool CreateDeviceD3D(HWND hWnd) {
+    DXGI_SWAP_CHAIN_DESC sd;
+    ZeroMemory(&sd, sizeof(sd));
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = 0;
+    sd.BufferDesc.Height = 0;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hWnd;
+    sd.SampleDesc.Count = 1;
+    sd.SampleDesc.Quality = 0;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    UINT createDeviceFlags = 0;
+    D3D_FEATURE_LEVEL featureLevel;
+    const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
+    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    if (res == DXGI_ERROR_UNSUPPORTED)
+        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    if (res != S_OK) return false;
+
+    CreateRenderTarget();
+    return true;
+}
+
+void CleanupDeviceD3D() {
+    CleanupRenderTarget();
+    if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
+    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
+    if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
+}
+
+void CreateRenderTarget() {
+    ID3D11Texture2D* pBackBuffer;
+    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+    pBackBuffer->Release();
+}
+
+void CleanupRenderTarget() {
+    if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
+}
