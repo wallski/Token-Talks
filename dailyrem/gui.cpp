@@ -45,6 +45,7 @@ static char g_InputBuffer[1024] = "";
 
 struct AppSettings {
     int theme = 0;
+    bool show_private_channels = true;
 };
 static AppSettings g_Settings;
 static bool g_ShowSettings = false;
@@ -58,6 +59,7 @@ void LoadSettings() {
         try {
             auto j = nlohmann::json::parse(content);
             if (j.contains("theme")) g_Settings.theme = j["theme"].get<int>();
+            if (j.contains("show_private_channels")) g_Settings.show_private_channels = j["show_private_channels"].get<bool>();
         } catch(...) {}
     }
 }
@@ -65,6 +67,7 @@ void LoadSettings() {
 void SaveSettings() {
     nlohmann::json j;
     j["theme"] = g_Settings.theme;
+    j["show_private_channels"] = g_Settings.show_private_channels;
     std::ofstream file("settings.json");
     file << j.dump(4);
 }
@@ -100,6 +103,12 @@ void ApplyTheme(int theme) {
             style.Colors[ImGuiCol_Button] = ImVec4(0.6f, 0.1f, 0.1f, 1.00f);
             style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.7f, 0.15f, 0.15f, 1.00f);
             style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.8f, 0.2f, 0.2f, 1.00f);
+        } else if (theme == 4) { // Amethyst
+            style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.05f, 0.12f, 1.00f);
+            style.Colors[ImGuiCol_ChildBg] = ImVec4(0.10f, 0.06f, 0.15f, 1.0f);
+            style.Colors[ImGuiCol_Button] = ImVec4(0.4f, 0.2f, 0.7f, 1.00f);
+            style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.5f, 0.25f, 0.85f, 1.00f);
+            style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.6f, 0.3f, 0.95f, 1.00f);
         }
     }
     
@@ -344,13 +353,20 @@ void DrawMainApp() {
         
         ImGui::Dummy(ImVec2(0, 10));
         ImGui::Text("Interface Theme");
-        const char* themes[] = { "Modern Blurple", "Midnight Stealth", "Ruby Crimson", "Classic Light" };
+        const char* themes[] = { "Modern Blurple", "Midnight Stealth", "Ruby Crimson", "Classic Light", "Amethyst Dark" };
         ImGui::PushItemWidth(300);
         if (ImGui::Combo("##ThemeSelect", &g_Settings.theme, themes, IM_ARRAYSIZE(themes))) {
             ApplyTheme(g_Settings.theme);
             SaveSettings();
         }
         ImGui::PopItemWidth();
+
+        ImGui::Dummy(ImVec2(0, 10));
+        ImGui::Text("Network Sync Options");
+        if (ImGui::Checkbox("Show Private / Locked Channels", &g_Settings.show_private_channels)) {
+            SaveSettings();
+        }
+
         ImGui::EndChild();
         ImGui::End();
         return;
@@ -380,8 +396,13 @@ void DrawMainApp() {
     {
         std::lock_guard<std::mutex> lock(g_DataMutex);
         for (const auto& c : g_Channels) {
+            if (!g_Settings.show_private_channels && c.is_locked) continue;
+            
             bool selected = (c.id == g_SelectedChannelId);
-            if (ImGui::Selectable(c.name.c_str(), selected)) {
+            std::string displayName = c.name;
+            if (c.is_locked) displayName = "[?] " + displayName;
+
+            if (ImGui::Selectable(displayName.c_str(), selected)) {
                 std::thread([c]() { RefreshMessages(c.id); }).detach();
             }
         }
@@ -399,47 +420,64 @@ void DrawMainApp() {
     {
         std::lock_guard<std::mutex> lock(g_ChatMutex);
         for (const auto& m : g_Messages) {
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.24f, 0.25f, 0.29f, 1.0f));
-            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
-            
-            ImGui::BeginChild(("msg_" + m.id).c_str(), ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_AlwaysAutoResize);
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", m.author.c_str());
-            ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 10);
-            ImGui::Text("%s", m.content.c_str());
-            ImGui::PopTextWrapPos();
+            float avail_w = ImGui::GetContentRegionAvail().x;
 
-            if (!m.attachment_url.empty()) {
-                ImGui::Dummy(ImVec2(0, 5));
-                HTTPTexture localTex = {nullptr, 0, 0};
-                bool needsLoad = false;
-                {
-                    std::lock_guard<std::mutex> texLock(g_TextureMutex);
-                    if (g_Textures.count(m.attachment_url) == 0) {
-                        g_Textures[m.attachment_url] = { nullptr, 0, 0 }; // Mark loading
-                        needsLoad = true;
-                    } else {
-                        localTex = g_Textures[m.attachment_url];
-                    }
-                }
-                if (needsLoad) {
-                    RequestTexture(m.attachment_url); // Safe, outside lock
-                }
-                if (localTex.view) {
-                    float drawH = 200.0f;
-                    float drawW = localTex.width * (drawH / localTex.height);
-                    if (drawW > ImGui::GetContentRegionAvail().x) {
-                         drawW = ImGui::GetContentRegionAvail().x;
-                         drawH = localTex.height * (drawW / localTex.width);
-                    }
-                    ImGui::Image((void*)localTex.view, ImVec2(drawW, drawH));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.22f, 0.23f, 0.27f, 1.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 8));
+
+            float img_total_h = 0.0f;
+            std::vector<std::pair<float,float>> img_sizes;
+            for (const auto& url : m.attachment_urls) {
+                std::lock_guard<std::mutex> tl(g_TextureMutex);
+                if (g_Textures.count(url) && g_Textures[url].view) {
+                    float drawW = (float)g_Textures[url].width;
+                    float drawH = (float)g_Textures[url].height;
+                    float maxW = avail_w - 20.0f;
+                    if (drawW > maxW) { drawH = drawH * (maxW / drawW); drawW = maxW; }
+                    if (drawH > 300.0f) { drawW = drawW * (300.0f / drawH); drawH = 300.0f; }
+                    img_sizes.push_back({drawW, drawH});
+                    img_total_h += drawH + 8.0f;
                 } else {
-                    ImGui::TextDisabled("[ Loading Media... ]");
+                    img_sizes.push_back({0, 20.0f});
+                    img_total_h += 28.0f;
                 }
             }
 
+            float text_h = ImGui::GetTextLineHeightWithSpacing() * 2.0f + img_total_h + 16.0f;
+            bool canAutoSize = text_h > 0;
+            ImGui::BeginChild(("msg_" + m.id).c_str(), ImVec2(avail_w - 4, text_h), false,
+                              ImGuiWindowFlags_NoScrollbar);
+
+            ImGui::TextColored(ImVec4(0.55f, 0.65f, 1.0f, 1.0f), "%s", m.author.c_str());
+            if (!m.content.empty()) {
+                ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+                ImGui::TextUnformatted(m.content.c_str());
+                ImGui::PopTextWrapPos();
+            }
+
+            size_t idx = 0;
+            for (const auto& url : m.attachment_urls) {
+                bool needLoad = false;
+                HTTPTexture localTex = {nullptr,0,0};
+                {
+                    std::lock_guard<std::mutex> tl(g_TextureMutex);
+                    if (g_Textures.count(url) == 0) { g_Textures[url] = {}; needLoad = true; }
+                    else localTex = g_Textures[url];
+                }
+                if (needLoad) RequestTexture(url);
+
+                if (localTex.view && idx < img_sizes.size()) {
+                    ImGui::Image((void*)localTex.view, ImVec2(img_sizes[idx].first, img_sizes[idx].second));
+                } else {
+                    ImGui::TextDisabled("[ Loading... ]");
+                }
+                idx++;
+                ImGui::Dummy(ImVec2(0, 4));
+            }
+
             ImGui::EndChild();
-            
-            ImGui::PopStyleVar();
+            ImGui::PopStyleVar(2);
             ImGui::PopStyleColor();
             
             if (m.author_id == gc.GetUserId() && !m.id.empty()) {

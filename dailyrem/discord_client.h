@@ -15,6 +15,7 @@ struct DiscordChannel {
     std::string id;
     std::string name;
     int type;
+    bool is_locked;
 };
 
 struct DiscordMessage {
@@ -22,8 +23,7 @@ struct DiscordMessage {
     std::string author;
     std::string author_id;
     std::string content;
-    std::string attachment_url;
-    std::string attachment_filename;
+    std::vector<std::string> attachment_urls;
 };
 
 class DiscordClient {
