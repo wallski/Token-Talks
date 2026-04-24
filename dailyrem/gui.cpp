@@ -79,6 +79,11 @@ static std::string g_ActiveVoiceGuildId = "";
 static bool g_ShowCallView = false;
 static bool g_IsMuted = false;
 static bool g_IsDeafened = false;
+static std::string g_LightboxUrl = "";
+static std::vector<std::string> g_ComposeFiles;
+static bool g_ComposeOpen = false;
+static bool g_IsFetchingMessages = false;
+static bool g_RefocusInput = false;
 
 static std::vector<std::string> g_InputDevices;
 static std::vector<std::string> g_OutputDevices;
@@ -401,6 +406,38 @@ std::string OpenMediaFileDialog() {
     return "";
 }
 
+static std::string MakeAvatarUrl(const std::string& uid, const std::string& hash) {
+    if (hash.empty() || uid.empty()) return "";
+    return "https://cdn.discordapp.com/avatars/" + uid + "/" + hash + ".png?size=40";
+}
+static std::string MakeGuildIconUrl(const std::string& gid, const std::string& hash) {
+    if (hash.empty() || gid.empty()) return "";
+    return "https://cdn.discordapp.com/icons/" + gid + "/" + hash + ".png?size=64";
+}
+static void DrawAvatarCircle(ImDrawList* dl, ImVec2 c, float r,
+                              const std::string& uid, const std::string& hash, const std::string& name) {
+    std::string url = MakeAvatarUrl(uid, hash);
+    bool drawn = false;
+    if (!url.empty()) {
+        bool need = false; HTTPTexture tx = {};
+        { std::lock_guard<std::mutex> lk(g_TextureMutex);
+          if (!g_Textures.count(url)) { g_Textures[url] = {}; need = true; } else tx = g_Textures[url]; }
+        if (need) RequestTexture(url);
+        if (tx.view) { dl->AddImageRounded((void*)tx.view, {c.x-r,c.y-r}, {c.x+r,c.y+r}, {0,0}, {1,1}, IM_COL32_WHITE, r); drawn = true; }
+    }
+    if (!drawn) {
+        uint32_t h = 5381; for (char ch : uid) h = ((h<<5)+h)+(unsigned char)ch;
+        static ImU32 pal[] = { IM_COL32(88,101,242,255), IM_COL32(87,242,135,255), IM_COL32(254,231,92,255),
+                                IM_COL32(235,69,158,255), IM_COL32(0,185,255,255),  IM_COL32(250,119,0,255) };
+        dl->AddCircleFilled(c, r, pal[h%6]);
+        if (!name.empty()) {
+            char s[2] = {(char)toupper((unsigned char)name[0]), 0};
+            ImVec2 ts = ImGui::CalcTextSize(s);
+            dl->AddText({c.x-ts.x*.5f, c.y-ts.y*.5f}, IM_COL32_WHITE, s);
+        }
+    }
+}
+
 static std::vector<Account> g_TokenAccounts;
 static std::vector<Account> g_MailAccounts;
 static bool g_IsLoggedIn = false;
@@ -690,75 +727,67 @@ void DrawCallView() {
             }
             
             ImGui::SetCursorPosY(185);
-            std::string nameLabel = members[i].m_Username;
+            // prefer display name over raw username
+            std::string nameLabel = members[i].m_DisplayName.empty() ? members[i].m_Username : members[i].m_DisplayName;
             if (isMe) nameLabel += " (You)";
             ImVec2 nSize = ImGui::CalcTextSize(nameLabel.c_str());
             ImGui::SetCursorPosX(110 - nSize.x * 0.5f);
-            ImGui::Text(nameLabel.c_str());
-            
+            ImGui::TextUnformatted(nameLabel.c_str());
+
+            // Draw avatar inside circle
+            if (!members[i].m_AvatarHash.empty()) {
+                std::string avUrl = MakeAvatarUrl(members[i].m_Id, members[i].m_AvatarHash);
+                DrawAvatarCircle(d, ImVec2(circleX, circleY), 68.f, members[i].m_Id, members[i].m_AvatarHash, nameLabel);
+            } else {
+                DrawAvatarCircle(d, ImVec2(circleX, circleY), 68.f, members[i].m_Id, "", nameLabel);
+            }
+
             if (members[i].m_IsMuted || members[i].m_IsDeafened) {
                 ImGui::SetCursorPosY(215);
                 const char* mTxt = members[i].m_IsDeafened ? "DEAFENED" : "MUTED";
                 ImVec2 mSize = ImGui::CalcTextSize(mTxt);
                 ImGui::SetCursorPosX(110 - mSize.x * 0.5f);
                 ImGui::TextColored(ImVec4(0.85f, 0.35f, 0.35f, 1.0f), mTxt);
-            } // This was the actual end of the m loop
+            }
             ImGui::EndChild();
             if (i < (int)members.size() - 1) ImGui::SameLine(0, 30);
         }
     }
     ImGui::EndGroup();
 
-    // Modern Floating Call Toolbar
+    // Floating Call Toolbar
     float toolbarW = 380;
     ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - toolbarW) * 0.5f, ImGui::GetWindowHeight() - 85));
-    
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 25.0f);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.14f, 0.95f));
     ImGui::BeginChild("CallControls", ImVec2(toolbarW, 60), true, ImGuiWindowFlags_NoScrollbar);
-    
+
     auto IconButton = [](const char* label, bool active, ImVec4 activeCol, const char* tooltip) {
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 20.0f);
-        if (active) ImGui::PushStyleColor(ImGuiCol_Button, activeCol);
-        else ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.19f, 0.21f, 1.0f));
-        
+        ImGui::PushStyleColor(ImGuiCol_Button, active ? activeCol : ImVec4(0.18f, 0.19f, 0.21f, 1.0f));
         ImGui::SetCursorPosY(10);
         bool pressed = ImGui::Button(label, ImVec2(80, 40));
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
-        
-        ImGui::PopStyleColor();
-        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(); ImGui::PopStyleVar();
         return pressed;
     };
 
     ImGui::SetCursorPosX(15);
-    if (IconButton(g_IsMuted ? "MIC OFF" : "MIC ON", g_IsMuted, ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "Toggle Microphone")) {
-        g_IsMuted = !g_IsMuted;
-        gc.SetVoiceState(g_IsMuted, g_IsDeafened);
-    }
-    ImGui::SameLine(0, 10);
-    if (IconButton(g_IsDeafened ? "DEAF ON" : "DEAF OFF", g_IsDeafened, ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "Toggle Deafen")) {
-        g_IsDeafened = !g_IsDeafened;
-        gc.SetVoiceState(g_IsMuted, g_IsDeafened);
-    }
-    ImGui::SameLine(0, 10);
-    if (IconButton("CHAT", false, ImVec4(0,0,0,0), "Switch to Chat")) {
-        g_ShowCallView = false;
-    }
-    ImGui::SameLine(0, 10);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.1f, 0.1f, 1.0f));
+    if (IconButton(g_IsMuted ? "MIC OFF" : "MIC ON", g_IsMuted, ImVec4(0.9f,0.3f,0.3f,1.f), "Toggle Mic")) { g_IsMuted=!g_IsMuted; gc.SetVoiceState(g_IsMuted,g_IsDeafened); }
+    ImGui::SameLine(0,10);
+    if (IconButton(g_IsDeafened ? "DEAF ON" : "DEAF OFF", g_IsDeafened, ImVec4(0.9f,0.3f,0.3f,1.f), "Toggle Deafen")) { g_IsDeafened=!g_IsDeafened; gc.SetVoiceState(g_IsMuted,g_IsDeafened); }
+    ImGui::SameLine(0,10);
+    if (IconButton("CHAT", false, {0,0,0,0}, "Back to Chat")) g_ShowCallView = false;
+    ImGui::SameLine(0,10);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.9f,0.2f,0.2f,1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.f,0.1f,0.1f,1.f));
     ImGui::SetCursorPosY(10);
-    if (ImGui::Button("DISCONNECT", ImVec2(90, 40))) {
-        gc.LeaveVoiceChannel(g_ActiveVoiceGuildId);
-        g_ActiveVoiceChannelId = "";
-        g_ShowCallView = false;
-    }
+    if (ImGui::Button("DISCONNECT", ImVec2(90,40))) { gc.LeaveVoiceChannel(g_ActiveVoiceGuildId); g_ActiveVoiceChannelId=""; g_ShowCallView=false; }
     ImGui::PopStyleColor(2);
-
-    ImGui::EndChild();
+    ImGui::EndChild();  // CallControls
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
+    ImGui::EndChild();  // CallContainer  <-- FIX: was missing, caused ImGui assert
 }
 
 void DrawMainApp() {
@@ -766,410 +795,516 @@ void DrawMainApp() {
     ImGui::SetNextWindowSize(ImGui::GetMainViewport()->Size);
     ImGui::Begin("MainApp", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
-    ImGui::Text("Logged in as User ID: %s", gc.GetUserId().c_str());
-    ImGui::SameLine(ImGui::GetWindowWidth() - 200);
-    if (ImGui::Button("Settings", ImVec2(90, 0))) {
-        g_ShowSettings = !g_ShowSettings;
-        if (g_ShowSettings) RefreshAudioDevices();
-    }
-    ImGui::SameLine(ImGui::GetWindowWidth() - 100);
-    if (ImGui::Button("Logout", ImVec2(80, 0))) {
-        std::thread([]() { gc.Disconnect(); }).detach();
-        g_IsLoggedIn = false;
-        g_ShowSettings = false; // Reset on logout
-    }
-    ImGui::Separator();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.118f,0.122f,0.133f,1.f));
+    ImGui::BeginChild("##topbar", ImVec2(0,40), false, ImGuiWindowFlags_NoScrollbar);
+    ImGui::SetCursorPos({10,10});
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.57f,0.62f,1.f));
+    std::string topLabel = gc.GetUserName().empty() ? gc.GetUserId() : gc.GetUserName();
+    ImGui::TextUnformatted(("Token-Talks  |  " + topLabel).c_str());
+    ImGui::PopStyleColor();
+    ImGui::SameLine(ImGui::GetWindowWidth()-190);
+    if (ImGui::Button("Settings", {88,24})) { g_ShowSettings=!g_ShowSettings; if(g_ShowSettings)RefreshAudioDevices(); }
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f,0.15f,0.15f,1.f));
+    if (ImGui::Button("Logout", {78,24})) { std::thread([](){gc.Disconnect();}).detach(); g_IsLoggedIn=false; g_ShowSettings=false; }
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
     
     if (g_ShowSettings) {
-        ImGui::BeginChild("SettingsPane", ImVec2(0, 0), true);
-        ImGui::SetWindowFontScale(1.5f);
-        ImGui::Text("Client Settings");
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->Pos);
+        ImGui::SetNextWindowSize(ImGui::GetMainViewport()->Size);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.18f, 0.19f, 0.22f, 1.0f));
+        ImGui::Begin("SettingsWindow", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        
+        static int selected_tab = 0;
+        
+        // Sidebar
+        ImGui::BeginChild("SettingsSidebar", ImVec2(260, 0), false);
+        ImGui::SetCursorPos({20, 60});
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.57f, 0.60f, 1.0f));
+        ImGui::SetWindowFontScale(0.9f);
+        ImGui::Text("USER SETTINGS");
         ImGui::SetWindowFontScale(1.0f);
-        ImGui::Separator();
-        ImGui::Dummy(ImVec2(0, 10));
-
-        if (ImGui::BeginTabBar("SettingsTabs")) {
-            if (ImGui::BeginTabItem("Appearance & Costumization")) {
-                ImGui::Dummy(ImVec2(0, 8));
-                ImGui::Text("Theme Selection");
-                if (ImGui::Combo("##Theme", &g_Settings.theme, "Slate Dark\0Discord Gray\0Ocean Blue\0Light Mode\0")) {
-                    ApplyTheme(g_Settings.theme);
-                    SaveSettings();
-                }
-
-                if (ImGui::Checkbox("Show Private / Locked Channels", &g_Settings.show_private_channels)) {
-                    SaveSettings();
-                }
-
-                ImGui::Dummy(ImVec2(0, 10));
-                ImGui::Text("Custom Font (Requires Restart)");
-                ImGui::InputText("##FontPath", g_Settings.font_path, sizeof(g_Settings.font_path));
-                ImGui::SameLine();
-                if (ImGui::Button("Browse...")) {
-                    OPENFILENAMEA ofn;
-                    char szFile[260] = { 0 };
-                    ZeroMemory(&ofn, sizeof(ofn));
-                    ofn.lStructSize = sizeof(ofn);
-                    ofn.hwndOwner = NULL;
-                    ofn.lpstrFile = szFile;
-                    ofn.nMaxFile = sizeof(szFile);
-                    ofn.lpstrFilter = "Font Files\0*.TTF;*.OTF\0All\0*.*\0";
-                    if (GetOpenFileNameA(&ofn) == TRUE) {
-                        strncpy_s(g_Settings.font_path, szFile, _TRUNCATE);
-                        SaveSettings();
-                    }
-                }
-                ImGui::EndTabItem();
-            }
-
-            if (ImGui::BeginTabItem("Voice & Audio")) {
-                ImGui::Dummy(ImVec2(0, 8));
-                
-                // Input Devices
-                ImGui::Text("Input Device");
-                if (ImGui::BeginCombo("##InDev", g_InputDevices[g_Settings.input_device < (int)g_InputDevices.size() ? g_Settings.input_device : 0].c_str())) {
-                    for (int i = 0; i < (int)g_InputDevices.size(); ++i) {
-                        if (ImGui::Selectable(g_InputDevices[i].c_str(), g_Settings.input_device == i)) {
-                            g_Settings.input_device = i;
-                            SaveSettings();
-                        }
-                    }
-                    ImGui::EndCombo();
-                }
-
-                ImGui::SliderFloat("Input Volume", &g_Settings.input_volume, 0.0f, 2.0f, "%.1fx");
-                
-                ImGui::Dummy(ImVec2(0, 10));
-
-                // Output Devices
-                ImGui::Text("Output Device");
-                if (ImGui::BeginCombo("##OutDev", g_OutputDevices[g_Settings.output_device < (int)g_OutputDevices.size() ? g_Settings.output_device : 0].c_str())) {
-                    for (int i = 0; i < (int)g_OutputDevices.size(); ++i) {
-                        if (ImGui::Selectable(g_OutputDevices[i].c_str(), g_Settings.output_device == i)) {
-                            g_Settings.output_device = i;
-                            SaveSettings();
-                        }
-                    }
-                    ImGui::EndCombo();
-                }
-
-                ImGui::SliderFloat("Output Volume", &g_Settings.output_volume, 0.0f, 2.0f, "%.1fx");
-
-                if (ImGui::Button("Refresh Devices")) RefreshAudioDevices();
-
-                ImGui::EndTabItem();
-            }
-
-            if (ImGui::BeginTabItem("Privacy & Safety")) {
-                ImGui::Dummy(ImVec2(0, 8));
-                static bool allowDms = true;
-                static bool filterMessages = true;
-                static bool showActivity = true;
-
-                if (ImGui::Checkbox("Allow Direct Messages from server members", &allowDms)) {}
-                ImGui::TextDisabled(" Disable this to block DMs from non-friends.");
-                
-                ImGui::Dummy(ImVec2(0, 5));
-                if (ImGui::Checkbox("Filter potentially explicit content in messages", &filterMessages)) {}
-                
-                ImGui::Dummy(ImVec2(0, 5));
-                if (ImGui::Checkbox("Display current activity as a status message", &showActivity)) {}
-                
-                ImGui::EndTabItem();
-            }
-            ImGui::EndTabBar();
-        }
-
+        ImGui::PopStyleColor();
+        ImGui::Dummy({0, 4});
+        
+        auto drawTab = [&](const char* name, int id) {
+            ImGui::SetCursorPosX(16);
+            ImGui::PushStyleColor(ImGuiCol_Header, selected_tab == id ? ImVec4(0.25f, 0.27f, 0.32f, 1.f) : ImVec4(0,0,0,0));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.22f, 0.24f, 0.28f, 1.f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+            if (ImGui::Selectable(name, selected_tab == id, 0, {228, 32})) selected_tab = id;
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(2);
+        };
+        
+        drawTab(" Appearance", 0);
+        drawTab(" Voice & Audio", 1);
+        drawTab(" Privacy & Safety", 2);
         ImGui::EndChild();
-        ImGui::End();
+        
+        ImGui::SameLine(0, 0);
+        
+        // Main Content Area
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.21f, 0.22f, 0.25f, 1.0f));
+        ImGui::BeginChild("SettingsContent", ImVec2(0, 0), false);
+        ImGui::SetCursorPos({40, 60});
+        ImGui::BeginGroup();
+        
+        if (selected_tab == 0) {
+            ImGui::SetWindowFontScale(1.2f);
+            ImGui::Text("Appearance");
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::Dummy({0, 20});
+            
+            ImGui::Text("Theme Selection");
+            ImGui::PushItemWidth(300);
+            if (ImGui::Combo("##Theme", &g_Settings.theme, "Blurple Dark\0Midnight\0Ruby\0Light Mode\0Amethyst\0")) {
+                ApplyTheme(g_Settings.theme);
+                SaveSettings();
+            }
+            ImGui::PopItemWidth();
+            
+            ImGui::Dummy({0, 10});
+            if (ImGui::Checkbox("Show Private / Locked Channels", &g_Settings.show_private_channels)) SaveSettings();
+
+            ImGui::Dummy({0, 20});
+            ImGui::Text("Custom Font (Requires Restart)");
+            ImGui::PushItemWidth(300);
+            ImGui::InputText("##FontPath", g_Settings.font_path, sizeof(g_Settings.font_path));
+            ImGui::PopItemWidth();
+            ImGui::SameLine();
+            if (ImGui::Button("Browse...")) {
+                std::string p = OpenMediaFileDialog();
+                if(!p.empty()){
+                    strncpy_s(g_Settings.font_path, p.c_str(), _TRUNCATE);
+                    SaveSettings();
+                }
+            }
+        } 
+        else if (selected_tab == 1) {
+            ImGui::SetWindowFontScale(1.2f);
+            ImGui::Text("Voice & Audio");
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::Dummy({0, 20});
+            
+            ImGui::Text("Input Device");
+            ImGui::PushItemWidth(400);
+            if (ImGui::BeginCombo("##InDev", g_InputDevices[g_Settings.input_device < (int)g_InputDevices.size() ? g_Settings.input_device : 0].c_str())) {
+                for (int i = 0; i < (int)g_InputDevices.size(); ++i) {
+                    if (ImGui::Selectable(g_InputDevices[i].c_str(), g_Settings.input_device == i)) {
+                        g_Settings.input_device = i; SaveSettings();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SliderFloat("Input Volume", &g_Settings.input_volume, 0.0f, 2.0f, "%.1fx");
+            
+            ImGui::Dummy({0, 20});
+            ImGui::Text("Output Device");
+            if (ImGui::BeginCombo("##OutDev", g_OutputDevices[g_Settings.output_device < (int)g_OutputDevices.size() ? g_Settings.output_device : 0].c_str())) {
+                for (int i = 0; i < (int)g_OutputDevices.size(); ++i) {
+                    if (ImGui::Selectable(g_OutputDevices[i].c_str(), g_Settings.output_device == i)) {
+                        g_Settings.output_device = i; SaveSettings();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SliderFloat("Output Volume", &g_Settings.output_volume, 0.0f, 2.0f, "%.1fx");
+            ImGui::PopItemWidth();
+            ImGui::Dummy({0, 10});
+            if (ImGui::Button("Refresh Devices")) RefreshAudioDevices();
+        } 
+        else if (selected_tab == 2) {
+            ImGui::SetWindowFontScale(1.2f);
+            ImGui::Text("Privacy & Safety");
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::Dummy({0, 20});
+            
+            static bool allowDms = true;
+            static bool filterMessages = true;
+            static bool showActivity = true;
+
+            ImGui::Checkbox("Allow Direct Messages from server members", &allowDms);
+            ImGui::TextDisabled(" Disable this to block DMs from non-friends.");
+            ImGui::Dummy(ImVec2(0, 10));
+            ImGui::Checkbox("Filter potentially explicit content in messages", &filterMessages);
+            ImGui::Dummy(ImVec2(0, 10));
+            ImGui::Checkbox("Display current activity as a status message", &showActivity);
+        }
+        ImGui::EndGroup();
+        
+        // Close Button
+        ImGui::SetCursorPos({ImGui::GetWindowWidth() - 100, 60});
+        ImGui::BeginGroup();
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 20.f);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f,0.3f,0.35f,1.f));
+        if (ImGui::Button("X", {40, 40})) g_ShowSettings = false;
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 8);
+        ImGui::TextDisabled("ESC");
+        ImGui::EndGroup();
+        
+        ImGui::EndChild();         // SettingsContent
+        ImGui::PopStyleColor();    // SettingsContent bg
+        
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) g_ShowSettings = false;
+        ImGui::End();              // SettingsWindow
+        ImGui::PopStyleColor();    // SettingsWindow WindowBg
+        ImGui::End();              // MainApp
         return;
     }
 
-    // Left Panel (Servers)
-    ImGui::BeginChild("Servers", ImVec2(200, 0), true);
-    if (ImGui::Selectable("  [ DIRECT MESSAGES ]", g_SelectedGuildId.empty())) {
-        std::thread([]() { RefreshPrivateChannels(); }).detach();
-    }
-    ImGui::Dummy(ImVec2(0, 4));
-    ImGui::Text("Servers");
-    ImGui::Separator();
-    {
-        std::lock_guard<std::mutex> lock(g_DataMutex);
-        for (const auto& g : g_Guilds) {
-            bool selected = (g.id == g_SelectedGuildId);
-            if (ImGui::Selectable(g.name.c_str(), selected)) {
-                std::thread([g]() { RefreshChannels(g.id); }).detach();
-            }
+    // ═══ 3-COLUMN LAYOUT ═══════════════════════════════════════════
+    const float RAIL_W=72.f, CHAN_W=220.f;
+    ImVec4 acV=ImGui::GetStyle().Colors[ImGuiCol_Button];
+    ImU32  accent=ImGui::ColorConvertFloat4ToU32(acV);
+
+    // ── SERVER RAIL ──────────────────────────────────────────────
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.118f,0.122f,0.133f,1.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0,8));
+    ImGui::BeginChild("##rail",{RAIL_W,0},false,ImGuiWindowFlags_NoScrollbar);
+    ImDrawList* rDL=ImGui::GetWindowDrawList();
+    auto serverBtn=[&](const std::string& id,const std::string& name,const std::string& iconH,bool active)->bool{
+        ImVec2 sp=ImGui::GetCursorScreenPos();
+        float cx=sp.x+RAIL_W*.5f,cy=sp.y+24.f,r=active?14.f:20.f;
+        if(active) rDL->AddRectFilled({sp.x,cy-16},{sp.x+4,cy+16},accent,2.f);
+        ImGui::InvisibleButton(("##s"+id).c_str(),{RAIL_W,48});
+        bool hov=ImGui::IsItemHovered(); if(hov&&!active) r=16.f;
+        std::string iurl=MakeGuildIconUrl(id,iconH);
+        bool drw=false;
+        if(!iurl.empty()){
+            bool need=false; HTTPTexture tx={};
+            {std::lock_guard<std::mutex> lk(g_TextureMutex);if(!g_Textures.count(iurl)){g_Textures[iurl]={};need=true;}else tx=g_Textures[iurl];}
+            if(need)RequestTexture(iurl);
+            if(tx.view){rDL->AddImageRounded((void*)tx.view,{cx-r,cy-r},{cx+r,cy+r},{0,0},{1,1},IM_COL32_WHITE,r);drw=true;}
         }
-    }
-    ImGui::EndChild();
-    
-    ImGui::SameLine();
+        if(!drw){
+            ImU32 bg=active?accent:(hov?IM_COL32(88,101,242,255):IM_COL32(54,57,62,255));
+            rDL->AddCircleFilled({cx,cy},r,bg);
+            if(!name.empty()){char s[2]={(char)toupper((unsigned char)name[0]),0};ImVec2 ts=ImGui::CalcTextSize(s);rDL->AddText({cx-ts.x*.5f,cy-ts.y*.5f},IM_COL32_WHITE,s);}
+        }
+        if(hov)ImGui::SetTooltip("%s",name.c_str());
+        return ImGui::IsItemClicked();
+    };
+    if(serverBtn("__dm__","DMs","",g_SelectedGuildId.empty())) std::thread([](){RefreshPrivateChannels();}).detach();
+    {ImVec2 p=ImGui::GetCursorScreenPos();rDL->AddRectFilled({p.x+14,p.y+4},{p.x+RAIL_W-14,p.y+6},IM_COL32(80,80,85,255),1.f);ImGui::Dummy({0,14});}
+    {std::lock_guard<std::mutex> lk(g_DataMutex);for(auto&g:g_Guilds)if(serverBtn(g.id,g.name,g.icon_hash,g.id==g_SelectedGuildId))std::thread([g](){RefreshChannels(g.id);}).detach();}
+    ImGui::EndChild();ImGui::PopStyleVar();ImGui::PopStyleColor();ImGui::SameLine(0,0);
 
-    // Middle Panel (Channels)
-    ImGui::BeginChild("Channels", ImVec2(200, 0), true);
-    ImGui::Text(g_SelectedGuildId.empty() ? "Messages" : "Channels");
-    ImGui::Separator();
+    // ── CHANNEL LIST ─────────────────────────────────────────────
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,ImVec4(0.157f,0.169f,0.188f,1.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
+    ImGui::BeginChild("##chan",{CHAN_W,0},false);
+    ImDrawList* cDL=ImGui::GetWindowDrawList();
     {
-        std::lock_guard<std::mutex> lock(g_DataMutex);
-        for (const auto& c : g_Channels) {
-            if (!g_Settings.show_private_channels && c.is_locked) continue;
-            
-            bool selected = (c.id == g_SelectedChannelId);
-            std::string displayName = c.name;
-            if (c.is_locked) displayName = "[?] " + displayName;
-
-            if (ImGui::Selectable(displayName.c_str(), selected)) {
-                if (c.type == 2) {
-                    gc.SetAudioDevices(g_Settings.input_device, g_Settings.output_device);
-                    if (gc.JoinVoiceChannel(g_SelectedGuildId, c.id)) {
-                        g_ActiveVoiceChannelId = c.id;
-                        g_ActiveVoiceChannelName = c.name;
-                        g_ActiveVoiceGuildId = g_SelectedGuildId;
-                        g_ShowCallView = true; // Auto-open call view
+        std::string hdr=g_SelectedGuildId.empty()?"Direct Messages":"";
+        {std::lock_guard<std::mutex> lk(g_DataMutex);for(auto&g:g_Guilds)if(g.id==g_SelectedGuildId){hdr=g.name;break;}}
+        ImVec2 hp=ImGui::GetCursorScreenPos();
+        cDL->AddRectFilled(hp,{hp.x+CHAN_W,hp.y+48},IM_COL32(32,34,37,255));
+        cDL->AddLine({hp.x,hp.y+48},{hp.x+CHAN_W,hp.y+48},IM_COL32(0,0,0,80));
+        ImGui::SetCursorPos({12,14});
+        ImGui::PushStyleColor(ImGuiCol_Text,{1,1,1,1});ImGui::TextUnformatted(hdr.c_str());ImGui::PopStyleColor();
+        ImGui::Dummy({0,16});
+    }
+    ImGui::BeginChild("##chsc",{0,0},false);
+    {
+        std::lock_guard<std::mutex> lk(g_DataMutex);
+        auto chs=g_Channels;
+        std::sort(chs.begin(),chs.end(),[](auto&a,auto&b){return a.position<b.position;});
+        auto drawSec=[&](const char* secLbl,int tf){
+            ImGui::Dummy({0,6});ImGui::SetCursorPosX(10);
+            ImGui::PushStyleColor(ImGuiCol_Text,{0.50f,0.52f,0.56f,1.f});
+            ImGui::TextUnformatted(secLbl);ImGui::PopStyleColor();
+            for(auto&c:chs){
+                if(c.type!=tf)continue;
+                if(!g_Settings.show_private_channels&&c.is_locked)continue;
+                bool sel=(c.id==g_SelectedChannelId);
+                // ASCII prefixes — default font has no emoji glyphs
+                std::string lb=(tf==2?"(vc) ":"# ")+c.name;
+                if(c.is_locked)lb="[L] "+c.name;
+                ImGui::PushStyleColor(ImGuiCol_Header,sel?ImVec4(0.22f,0.24f,0.30f,1.f):ImVec4(0,0,0,0));
+                ImGui::PushStyleColor(ImGuiCol_HeaderHovered,{0.18f,0.20f,0.26f,1.f});
+                ImGui::PushStyleColor(ImGuiCol_HeaderActive,{0.24f,0.26f,0.32f,1.f});
+                ImGui::SetCursorPosX(8);
+                if(ImGui::Selectable(lb.c_str(),sel,0,{CHAN_W-16,28})){
+                    if(tf==2){
+                        gc.SetAudioDevices(g_Settings.input_device,g_Settings.output_device);
+                        if(gc.JoinVoiceChannel(g_SelectedGuildId,c.id)){g_ActiveVoiceChannelId=c.id;g_ActiveVoiceChannelName=c.name;g_ActiveVoiceGuildId=g_SelectedGuildId;g_ShowCallView=true;}
+                    } else {std::thread([c](){RefreshMessages(c.id);}).detach();}
+                }
+                ImGui::PopStyleColor(3);
+                if(tf==2){
+                    std::lock_guard<std::mutex> vl(gc.m_VoiceMutex);
+                    for(auto&vm:gc.m_VoiceMembers)if(vm.m_ChannelId==c.id){
+                        ImGui::SetCursorPosX(22);
+                        ImGui::PushStyleColor(ImGuiCol_Text,{0.38f,0.82f,0.44f,0.9f});
+                        std::string vn=vm.m_DisplayName.empty()?vm.m_Username:vm.m_DisplayName;
+                        ImGui::TextUnformatted(("  * "+vn).c_str());
+                        ImGui::PopStyleColor();
                     }
-                } else {
-                    std::thread([c]() { RefreshMessages(c.id); }).detach();
                 }
             }
+        };
+        if(g_SelectedGuildId.empty()){
+            // DM mode: all channels are type 1 (DM) or 3 (group DM) — show flat list
+            ImGui::Dummy({0,6});ImGui::SetCursorPosX(10);
+            ImGui::PushStyleColor(ImGuiCol_Text,{0.50f,0.52f,0.56f,1.f});
+            ImGui::TextUnformatted("DIRECT MESSAGES");ImGui::PopStyleColor();
+            for(auto&c:chs){
+                bool sel=(c.id==g_SelectedChannelId);
+                ImGui::PushStyleColor(ImGuiCol_Header,sel?ImVec4(0.22f,0.24f,0.30f,1.f):ImVec4(0,0,0,0));
+                ImGui::PushStyleColor(ImGuiCol_HeaderHovered,{0.18f,0.20f,0.26f,1.f});
+                ImGui::PushStyleColor(ImGuiCol_HeaderActive,{0.24f,0.26f,0.32f,1.f});
+                ImGui::SetCursorPosX(8);
+                if(ImGui::Selectable(c.name.c_str(),sel,0,{CHAN_W-16,28}))
+                    std::thread([c](){RefreshMessages(c.id);}).detach();
+                ImGui::PopStyleColor(3);
+            }
+        } else {
+            drawSec("TEXT CHANNELS",0);
+            drawSec("VOICE CHANNELS",2);
         }
     }
-    
-    ImGui::EndChild();
-    
-    ImGui::SameLine();
+    ImGui::EndChild();ImGui::EndChild();ImGui::PopStyleVar();ImGui::PopStyleColor();ImGui::SameLine(0,0);
 
-    // Right Panel (Content)
-    ImGui::BeginChild("Content", ImVec2(0, 0), true);
-    
-    if (!g_ActiveVoiceChannelId.empty() && g_ShowCallView) {
+    // ── CONTENT ──────────────────────────────────────────────────
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,ImVec4(0.212f,0.224f,0.243f,1.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0,0));
+    ImGui::BeginChild("##content",{0,0},false,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
+    if(!g_ActiveVoiceChannelId.empty()&&g_ShowCallView){
         DrawCallView();
     } else {
-        // Floating Call Header if active but not in full view
-        if (!g_ActiveVoiceChannelId.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f, 0.16f, 0.18f, 1.0f));
-            ImGui::SetCursorPos(ImVec2(20, 10));
-            ImGui::BeginChild("FloatingCall", ImVec2(ImGui::GetContentRegionAvail().x - 40, 44), true);
-            ImGui::SetCursorPos(ImVec2(10, 10));
-            if (!gc.m_VoiceConn.m_Ready) {
-                ImGui::TextColored(ImColor(200, 200, 50), "VOICE: CONNECTING TO %s...", g_ActiveVoiceChannelName.c_str());
-            } else {
-                ImGui::TextColored(ImColor(50, 180, 50), "VOICE ACTIVE: %s", g_ActiveVoiceChannelName.c_str());
-            }
-            ImGui::SameLine(ImGui::GetWindowWidth() - 140);
-            if (ImGui::Button("RETURN TO CALL", ImVec2(130, 26))) g_ShowCallView = true;
-            ImGui::EndChild();
-            ImGui::PopStyleColor();
-            ImGui::Dummy(ImVec2(0, 48)); // Offset chat
+        if(!g_ActiveVoiceChannelId.empty()){
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,{0.10f,0.12f,0.14f,0.95f});
+            ImGui::SetCursorPos({10,6});ImGui::BeginChild("##vcpill",{ImGui::GetContentRegionAvail().x-20,36},false);
+            ImGui::SetCursorPos({10,8});
+            if(!gc.m_VoiceConn.m_Ready)ImGui::TextColored({0.9f,0.8f,0.1f,1.f},"(vc) Connecting... %s",g_ActiveVoiceChannelName.c_str());
+            else ImGui::TextColored({0.3f,0.9f,0.4f,1.f},"(vc) Voice Active: %s",g_ActiveVoiceChannelName.c_str());
+            ImGui::SameLine(ImGui::GetWindowWidth()-148);
+            if(ImGui::Button("Open Call",{138,22}))g_ShowCallView=true;
+            ImGui::EndChild();ImGui::PopStyleColor();ImGui::Dummy({0,2});
         }
-
-        ImGui::Text("Chat: %s", g_SelectedChannelId.c_str());
-        ImGui::Separator();
-
-        ImGui::BeginChild("MessagesScroll", ImVec2(0, -45), true);
         {
-            std::lock_guard<std::mutex> lock(g_ChatMutex);
-            for (const auto& m : g_Messages) {
-                float avail_w = ImGui::GetContentRegionAvail().x;
-
-                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.22f, 0.23f, 0.27f, 1.0f));
-                ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 8));
-
-                float img_total_h = 0.0f;
-                std::vector<std::pair<float,float>> img_sizes;
-                for (const auto& url : m.attachment_urls) {
-                    std::lock_guard<std::mutex> tl(g_TextureMutex);
-                    if (g_Textures.count(url) && g_Textures[url].view) {
-                        float drawW = (float)g_Textures[url].width;
-                        float drawH = (float)g_Textures[url].height;
-                        float maxW = avail_w - 20.0f;
-                        if (drawW > maxW) { drawH = drawH * (maxW / drawW); drawW = maxW; }
-                        if (drawH > 300.0f) { drawW = drawW * (300.0f / drawH); drawH = 300.0f; }
-                        img_sizes.push_back({drawW, drawH});
-                        img_total_h += drawH + 8.0f;
-                    } else {
-                        img_sizes.push_back({0, 20.0f});
-                        img_total_h += 28.0f;
-                    }
-                }
-
-                float text_h = ImGui::GetTextLineHeightWithSpacing() * 2.0f + img_total_h + 16.0f;
-                ImGui::BeginChild(("msg_" + m.id).c_str(), ImVec2(avail_w - 4, text_h), false, ImGuiWindowFlags_NoScrollbar);
-
-                ImGui::TextColored(ImVec4(0.55f, 0.65f, 1.0f, 1.0f), "%s", m.author.c_str());
-                if (!m.content.empty()) {
-                    ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
-                    ImGui::TextUnformatted(m.content.c_str());
-                    ImGui::PopTextWrapPos();
-                }
-
-
-                ImGui::Dummy(ImVec2(0, 6));
-
-            size_t idx = 0;
-            for (const auto& url : m.attachment_urls) {
-                bool needLoad = false;
-                HTTPTexture localTex = {nullptr,0,0};
-                {
-                    std::lock_guard<std::mutex> tl(g_TextureMutex);
-                    if (g_Textures.count(url) == 0) { g_Textures[url] = {}; needLoad = true; }
-                    else localTex = g_Textures[url];
-                }
-                if (needLoad) RequestTexture(url);
-
-                if (localTex.view && idx < img_sizes.size()) {
-                    ID3D11ShaderResourceView* drawView = localTex.view;
-                    if (!localTex.frames.empty() && localTex.total_duration > 0) {
-                        int currentTimeMs = (int)(ImGui::GetTime() * 1000.0) % localTex.total_duration;
-                        int accumulated = 0;
-                        for (size_t f = 0; f < localTex.frames.size(); ++f) {
-                            accumulated += localTex.delays[f];
-                            if (currentTimeMs < accumulated) {
-                                drawView = localTex.frames[f];
-                                break;
-                            }
+            std::string ch_hdr="Select a channel";
+            {std::lock_guard<std::mutex> lk(g_DataMutex);for(auto&c:g_Channels)if(c.id==g_SelectedChannelId){ch_hdr=(c.type==2?"(vc) ":"# ")+c.name;break;}}
+            ImGui::SetCursorPosX(14);
+            ImGui::PushStyleColor(ImGuiCol_Text,{0.95f,0.96f,0.98f,1.f});ImGui::TextUnformatted(ch_hdr.c_str());ImGui::PopStyleColor();
+            ImGui::Dummy({0,4});
+        }
+        // Messages — height leaves room for input bar + optional compose staging
+        float inputAreaH = 54.f;
+        if (g_ComposeOpen && !g_ComposeFiles.empty()) inputAreaH += 68.f;
+        ImGui::BeginChild("##msgs",{0,-inputAreaH},false);
+        if (ImGui::GetScrollY() < 50.0f && !g_IsFetchingMessages && !g_SelectedChannelId.empty()) {
+            bool hasMessages = false; std::string firstId;
+            { std::lock_guard<std::mutex> lk(g_ChatMutex); if(!g_Messages.empty()){ hasMessages=true; firstId=g_Messages[0].id; } }
+            if (hasMessages) {
+                g_IsFetchingMessages = true;
+                std::string ch = g_SelectedChannelId;
+                std::thread([ch, firstId]() {
+                    auto old_msgs = gc.FetchMessages(ch, firstId);
+                    if (!old_msgs.empty()) {
+                        std::lock_guard<std::mutex> lock(g_ChatMutex);
+                        if(g_SelectedChannelId == ch) {
+                            g_Messages.insert(g_Messages.begin(), old_msgs.begin(), old_msgs.end());
+                            // ImGui doesn't preserve scroll when elements are prepended, but this achieves pagination.
                         }
                     }
-                    ImGui::Image((void*)drawView, ImVec2(img_sizes[idx].first, img_sizes[idx].second));
-                } else {
-                    ImGui::TextDisabled("[ Loading... ]");
-                }
-                idx++;
-                ImGui::Dummy(ImVec2(0, 4));
+                    g_IsFetchingMessages = false;
+                }).detach();
             }
-
-            for (const auto& url : m.video_urls) {
-                bool needLoad = false;
-                VideoTexture localVid = {nullptr};
-                {
-                    std::lock_guard<std::mutex> vl(g_VideoMutex);
-                    if (g_Videos.count(url) == 0) { g_Videos[url] = {nullptr}; needLoad = true; }
-                    else localVid = g_Videos[url];
-                }
-                if (needLoad) RequestVideo(url);
-
-                if (localVid.view) {
-                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-                    std::string vidId = "VIDID_" + url;
-                    if (ImGui::ImageButton(vidId.c_str(), (void*)localVid.view, ImVec2((float)localVid.width * 0.5f, (float)localVid.height * 0.5f))) {
-                        // Toggle play state or open larger view
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_ChatMutex);
+            ImDrawList* dl=ImGui::GetWindowDrawList();
+            const float AV_R=18.f,LEFT=16.f+36.f+10.f;
+            float aw=ImGui::GetContentRegionAvail().x;
+            std::string prevAid;
+            for(auto&m:g_Messages){
+                bool same=(m.author_id==prevAid);prevAid=m.author_id;
+                if(!same){
+                    ImGui::Dummy({0,8});
+                    ImVec2 avSp=ImGui::GetCursorScreenPos();
+                    DrawAvatarCircle(dl,{avSp.x+16.f+AV_R,avSp.y+AV_R},AV_R,m.author_id,m.author_avatar,m.author);
+                    ImGui::SetCursorPosX(LEFT);
+                    ImGui::PushStyleColor(ImGuiCol_Text,{0.93f,0.94f,0.96f,1.f});ImGui::TextUnformatted(m.author.c_str());ImGui::PopStyleColor();
+                    if(!m.timestamp.empty()&&m.timestamp.size()>=16){
+                        ImGui::SameLine();
+                        ImGui::PushStyleColor(ImGuiCol_Text,{0.38f,0.40f,0.44f,1.f});
+                        ImGui::Text(" %s",m.timestamp.substr(11,5).c_str());ImGui::PopStyleColor();
                     }
-                    ImGui::PopStyleVar();
-                    ImGui::TextDisabled("Video Attachment (%dx%d)", localVid.width, localVid.height);
-                } else {
-                    ImGui::TextDisabled("[ Loading Video Thumbnail... ]");
+                } else {ImGui::Dummy({0,1});}
+                if(!m.content.empty()){
+                    ImGui::SetCursorPosX(LEFT);
+                    ImGui::PushTextWrapPos(aw-8.f);
+                    ImGui::PushStyleColor(ImGuiCol_Text,{0.82f,0.83f,0.86f,1.f});
+                    ImGui::TextUnformatted(m.content.c_str());
+                    ImGui::PopStyleColor();ImGui::PopTextWrapPos();
                 }
-            }
-
-            if (!m.reactions.empty()) {
-                ImGui::Dummy(ImVec2(0, 2));
-                for (const auto& r : m.reactions) {
-                    std::string label = r.emoji + " " + std::to_string(r.count);
-                    ImVec4 btnCol = r.me ? ImVec4(0.35f, 0.45f, 0.9f, 0.6f) : ImVec4(0.2f, 0.2f, 0.25f, 0.6f);
-                    ImGui::PushStyleColor(ImGuiCol_Button, btnCol);
-                    if (ImGui::Button((label + "##" + m.id).c_str())) {
-                        std::string cid = g_SelectedChannelId;
-                        std::string mid = m.id;
-                        std::string emo = r.emoji;
-                        std::thread([cid, mid, emo]() {
-                            gc.AddReaction(cid, mid, emo);
-                            RefreshMessages(cid);
-                        }).detach();
+                for(auto&url:m.attachment_urls){
+                    bool need=false;HTTPTexture tx={};
+                    {std::lock_guard<std::mutex> tl(g_TextureMutex);if(!g_Textures.count(url)){g_Textures[url]={};need=true;}else tx=g_Textures[url];}
+                    if(need)RequestTexture(url);
+                    ImGui::SetCursorPosX(LEFT);
+                    if(tx.view){
+                        float dw=(float)tx.width,dh=(float)tx.height,maxW=aw-LEFT-8.f;
+                        if(dw>maxW){dh*=maxW/dw;dw=maxW;}if(dh>300.f){dw*=300.f/dh;dh=300.f;}
+                        ID3D11ShaderResourceView* dv=tx.view;
+                        if(!tx.frames.empty()&&tx.total_duration>0){
+                            int t=(int)(ImGui::GetTime()*1000.)%tx.total_duration,acc=0;
+                            for(size_t f=0;f<tx.frames.size();++f){acc+=tx.delays[f];if(t<acc){dv=tx.frames[f];break;}}
+                        }
+                        ImVec2 cp=ImGui::GetCursorScreenPos();
+                        ImGui::InvisibleButton(("##img"+m.id+url).c_str(),{dw,dh});
+                        if(ImGui::IsItemHovered())ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                        if(ImGui::IsItemClicked())g_LightboxUrl=url;
+                        ImGui::GetWindowDrawList()->AddImageRounded((void*)dv,cp,{cp.x+dw,cp.y+dh},{0,0},{1,1},IM_COL32_WHITE,4.f);
+                    } else {ImGui::TextDisabled("[Loading...]");}
+                }
+                for(auto&url:m.video_urls){
+                    bool need=false;VideoTexture vt={};
+                    {std::lock_guard<std::mutex> vl(g_VideoMutex);if(!g_Videos.count(url)){g_Videos[url]={};need=true;}else vt=g_Videos[url];}
+                    if(need)RequestVideo(url);
+                    ImGui::SetCursorPosX(LEFT);
+                    if(vt.view){ImGui::ImageButton(("VID"+url).c_str(),(void*)vt.view,{(float)vt.width*.4f,(float)vt.height*.4f});ImGui::TextDisabled("Video");}
+                    else ImGui::TextDisabled("[Loading video...]");
+                }
+                if(!m.reactions.empty()){
+                    ImGui::SetCursorPosX(LEFT);
+                    for(auto&r:m.reactions){
+                        ImGui::PushStyleColor(ImGuiCol_Button,r.me?ImVec4(0.35f,0.45f,0.9f,0.55f):ImVec4(0.18f,0.19f,0.22f,0.75f));
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,12.f);
+                        if(ImGui::Button((r.emoji+" "+std::to_string(r.count)+"##r"+m.id).c_str())){
+                            std::string cid=g_SelectedChannelId,mid=m.id,emo=r.emoji;
+                            std::thread([cid,mid,emo](){gc.AddReaction(cid,mid,emo);RefreshMessages(cid);}).detach();
+                        }
+                        ImGui::PopStyleVar();ImGui::PopStyleColor();ImGui::SameLine(0,4);
                     }
-                    ImGui::PopStyleColor();
-                    ImGui::SameLine();
+                    ImGui::NewLine();
                 }
-                ImGui::NewLine();
+                if(m.author_id==gc.GetUserId()&&!m.id.empty()){
+                    if(ImGui::BeginPopupContextItem(("CTX_"+m.id).c_str())){
+                        if(ImGui::MenuItem("Edit")){g_EditingMessageId=m.id;strncpy_s(g_EditBuffer,m.content.c_str(),_TRUNCATE);}
+                        if(ImGui::MenuItem("Delete")){std::string cid=g_SelectedChannelId,mid=m.id;std::thread([cid,mid](){gc.DeleteMessage(cid,mid);RefreshMessages(cid);}).detach();}
+                        ImGui::EndPopup();
+                    }
+                }
+                if(g_EditingMessageId==m.id){
+                    ImGui::SetCursorPosX(LEFT);
+                    ImGui::PushItemWidth(aw-LEFT-70.f);
+                    ImGui::InputText(("##ed"+m.id).c_str(),g_EditBuffer,sizeof(g_EditBuffer));
+                    ImGui::PopItemWidth();ImGui::SameLine();
+                    if(ImGui::Button("Save",{58,0})){std::string cid=g_SelectedChannelId,mid=m.id,msg=g_EditBuffer;std::thread([cid,mid,msg](){gc.EditMessage(cid,mid,msg);RefreshMessages(cid);}).detach();g_EditingMessageId="";}
+                }
             }
-
+            if(ImGui::GetScrollY()>=ImGui::GetScrollMaxY())ImGui::SetScrollHereY(1.f);
+        }
+        ImGui::EndChild();
+        // Input bar — wrapped with padding
+        ImGui::Dummy({0,4});
+        ImGui::SetCursorPosX(8.f);
+        
+        // ── COMPOSE STAGING AREA ─────────────────────────────────────
+        if (g_ComposeOpen && !g_ComposeFiles.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.16f,0.17f,0.19f,1.f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.f);
+            ImGui::BeginChild("ComposeStaging", {0, 60}, true, ImGuiWindowFlags_NoScrollbar);
+            for(size_t i=0; i<g_ComposeFiles.size(); ++i){
+                ImGui::PushID((int)i);
+                ImGui::BeginChild("FileCard", {200, 44}, true, ImGuiWindowFlags_NoScrollbar);
+                // Extract filename
+                std::string path = g_ComposeFiles[i];
+                std::string filename = path.substr(path.find_last_of("/\\") + 1);
+                ImGui::SetCursorPos({10, 14});
+                ImGui::TextUnformatted(filename.c_str());
+                ImGui::SameLine(160);
+                ImGui::SetCursorPosY(10);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f,0.2f,0.2f,0.6f));
+                if(ImGui::Button("X", {24,24})) {
+                    g_ComposeFiles.erase(g_ComposeFiles.begin() + i);
+                    if(g_ComposeFiles.empty()) g_ComposeOpen = false;
+                }
+                ImGui::PopStyleColor();
+                ImGui::EndChild();
+                ImGui::PopID();
+                if(i < g_ComposeFiles.size() - 1) ImGui::SameLine();
+            }
             ImGui::EndChild();
-            ImGui::PopStyleVar(2);
+            ImGui::PopStyleVar();
             ImGui::PopStyleColor();
-            
-            if (m.author_id == gc.GetUserId() && !m.id.empty()) {
-                if (ImGui::BeginPopupContextItem(("CTX_" + m.id).c_str())) {
-                    if (ImGui::MenuItem("Edit Message")) {
-                        g_EditingMessageId = m.id;
-                        strncpy_s(g_EditBuffer, m.content.c_str(), _TRUNCATE);
-                    }
-                    if (ImGui::MenuItem("Delete Message")) {
-                        std::string cid = g_SelectedChannelId;
-                        std::string mid = m.id;
-                        std::thread([cid, mid]() {
-                            gc.DeleteMessage(cid, mid);
-                            RefreshMessages(cid);
-                        }).detach();
-                    }
-                    ImGui::EndPopup();
+        }
+
+        ImGui::SetCursorPosX(8.f);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,ImVec4(0.16f,0.17f,0.19f,1.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,8.f);
+        if(ImGui::Button("+",{28,28})){
+            std::string p=OpenMediaFileDialog();
+            if(!p.empty()){
+                g_ComposeFiles.push_back(p);
+                g_ComposeOpen = true;
+            }
+        }
+        ImGui::SameLine();
+        ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x-74.f);
+        if (g_RefocusInput) { ImGui::SetKeyboardFocusHere(0); g_RefocusInput = false; }
+        bool doSend=ImGui::InputText("##inp",g_InputBuffer,sizeof(g_InputBuffer),ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::PopItemWidth();ImGui::SameLine();
+        doSend|=ImGui::Button("Send",{55,28});
+        
+        if(doSend && !g_SelectedChannelId.empty()){
+            bool hasText = strlen(g_InputBuffer) > 0;
+            bool hasFiles = !g_ComposeFiles.empty();
+            if(hasText || hasFiles){
+                std::string ct=g_InputBuffer,ch=g_SelectedChannelId;
+                std::vector<std::string> files = g_ComposeFiles;
+                memset(g_InputBuffer,0,sizeof(g_InputBuffer));
+                g_ComposeFiles.clear();
+                g_ComposeOpen = false;
+                std::thread([ch, ct, files, hasText, hasFiles](){
+                    for(const auto& f : files) gc.SendAttachment(ch, f);
+                    if(hasText) gc.SendDiscordMessage(ch, ct);
+                    RefreshMessages(ch);
+                }).detach();
+            }
+            g_RefocusInput = true; // restore focus next frame
+        }
+        ImGui::PopStyleVar();ImGui::PopStyleColor();
+    }
+    // ── LIGHTBOX OVERLAY ─────────────────────────────────────────
+    if(!g_LightboxUrl.empty()){
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->Pos);
+        ImGui::SetNextWindowSize(ImGui::GetMainViewport()->Size);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4(0,0,0,0.85f));
+        if(ImGui::Begin("Lightbox",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoScrollWithMouse|ImGuiWindowFlags_NoBringToFrontOnFocus)){
+            ImDrawList* dl=ImGui::GetWindowDrawList();
+            HTTPTexture tx={};{std::lock_guard<std::mutex> tl(g_TextureMutex);if(g_Textures.count(g_LightboxUrl))tx=g_Textures[g_LightboxUrl];}
+            if(tx.view){
+                float dw=(float)tx.width, dh=(float)tx.height;
+                float vpW=ImGui::GetWindowWidth(), vpH=ImGui::GetWindowHeight();
+                float scale=(std::min)(vpW/dw, vpH/dh);
+                if(scale>1.f)scale=1.f;
+                dw*=scale; dh*=scale;
+                ImVec2 p0={ImGui::GetWindowPos().x+(vpW-dw)*0.5f,ImGui::GetWindowPos().y+(vpH-dh)*0.5f};
+                
+                ID3D11ShaderResourceView* dv=tx.view;
+                if(!tx.frames.empty()&&tx.total_duration>0){
+                    int t=(int)(ImGui::GetTime()*1000.)%tx.total_duration,acc=0;
+                    for(size_t f=0;f<tx.frames.size();++f){acc+=tx.delays[f];if(t<acc){dv=tx.frames[f];break;}}
                 }
+                dl->AddImage((void*)dv,p0,{p0.x+dw,p0.y+dh});
             }
-
-            if (g_EditingMessageId == m.id) {
-                ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 60);
-                ImGui::InputText(("##Edit" + m.id).c_str(), g_EditBuffer, sizeof(g_EditBuffer));
-                ImGui::PopItemWidth();
-                ImGui::SameLine();
-                if (ImGui::Button("Save", ImVec2(50, 0))) {
-                    std::string cid = g_SelectedChannelId;
-                    std::string mid = m.id;
-                    std::string msg = g_EditBuffer;
-                    std::thread([cid, mid, msg]() {
-                        gc.EditMessage(cid, mid, msg);
-                        RefreshMessages(cid);
-                    }).detach();
-                    g_EditingMessageId = "";
-                }
-            }
-
-                ImGui::Dummy(ImVec2(0, 8));
-            }
+            if(ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0)) g_LightboxUrl="";
+            if(ImGui::IsKeyPressed(ImGuiKey_Escape)) g_LightboxUrl="";
         }
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-            ImGui::SetScrollHereY(1.0f);
+        ImGui::End();
+        ImGui::PopStyleColor();
     }
-    ImGui::EndChild();
-    
-    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 100);
 
-    if (ImGui::Button("+", ImVec2(30, 24))) {
-        std::string path = OpenMediaFileDialog();
-        if (!path.empty() && !g_SelectedChannelId.empty()) {
-            std::string chId = g_SelectedChannelId;
-            std::thread([chId, path]() {
-                gc.SendAttachment(chId, path);
-                RefreshMessages(chId);
-            }).detach();
-        }
-    }
-    ImGui::SameLine();
-
-    if (ImGui::InputText("##Send", g_InputBuffer, sizeof(g_InputBuffer), ImGuiInputTextFlags_EnterReturnsTrue)) {
-        if (strlen(g_InputBuffer) > 0 && !g_SelectedChannelId.empty()) {
-            std::string content = g_InputBuffer;
-            std::string chId = g_SelectedChannelId;
-            memset(g_InputBuffer, 0, sizeof(g_InputBuffer));
-            std::thread([chId, content]() {
-                gc.SendDiscordMessage(chId, content);
-                RefreshMessages(chId);
-            }).detach();
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Send")) {
-        if (strlen(g_InputBuffer) > 0 && !g_SelectedChannelId.empty()) {
-            std::string content = g_InputBuffer;
-            std::string chId = g_SelectedChannelId;
-            memset(g_InputBuffer, 0, sizeof(g_InputBuffer));
-            std::thread([chId, content]() {
-                gc.SendDiscordMessage(chId, content);
-                RefreshMessages(chId);
-            }).detach();
-        }
-    }
-    ImGui::PopItemWidth();
-    
-    ImGui::EndChild();
+    ImGui::EndChild();ImGui::PopStyleVar();ImGui::PopStyleColor();
     ImGui::End();
 }
 
@@ -1268,6 +1403,9 @@ int RunGUI() {
     CleanupDeviceD3D();
     ::DestroyWindow(hwnd);
     ::UnregisterClass(wc.lpszClassName, wc.hInstance);
+
+    gc.Disconnect();
+    ExitProcess(0);
 
     return 0;
 }

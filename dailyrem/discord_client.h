@@ -26,13 +26,16 @@
 struct DiscordGuild {
     std::string id;
     std::string name;
+    std::string icon_hash; // CDN: discord.com/icons/{id}/{hash}.png
 };
 
 struct DiscordChannel {
     std::string id;
     std::string name;
-    int type;
+    int type;       // 0=text, 2=voice, 4=category
     bool is_locked;
+    int  position = 0;
+    std::string parent_id; // category id
 };
 
 struct DiscordReaction {
@@ -43,7 +46,10 @@ struct DiscordReaction {
 
 struct VoiceMember {
     std::string m_Id;
-    std::string m_Username;
+    std::string m_Username;    // fallback / unique handle
+    std::string m_DisplayName; // global_name or server nick
+    std::string m_AvatarHash;  // for CDN avatar URL
+    std::string m_ChannelId;   // which VC they're in
     bool m_IsMuted    = false;
     bool m_IsDeafened = false;
     bool m_IsSpeaking = false; // green ring indicator
@@ -74,8 +80,11 @@ struct VoiceConnection {
 
 struct DiscordMessage {
     std::string id;
-    std::string author;
+    std::string author;       // display name (global_name preferred)
     std::string author_id;
+    std::string author_username; // raw username for fallback
+    std::string author_avatar;   // avatar hash for CDN
+    std::string timestamp;       // ISO8601 from Discord
     std::string content;
     std::vector<std::string>     attachment_urls;
     std::vector<std::string>     video_urls;
@@ -95,6 +104,8 @@ public:
     void        SetToken(const std::string& token);
     std::string GetToken()  const;
     std::string GetUserId() const;
+    std::string GetUserName() const;
+    std::string GetUserAvatar() const;
     static bool        ValidateToken(const std::string& token);
     static std::string LoginWithCredentials(const std::string& email, const std::string& password, std::string& out_mfa_ticket);
     static std::string SubmitMfaCode(const std::string& code, const std::string& ticket);
@@ -108,7 +119,7 @@ public:
     std::vector<DiscordGuild>    FetchGuilds();
     std::vector<DiscordChannel>  FetchChannels(const std::string& guild_id);
     std::vector<DiscordChannel>  FetchPrivateChannels();
-    std::vector<DiscordMessage>  FetchMessages(const std::string& channel_id);
+    std::vector<DiscordMessage>  FetchMessages(const std::string& channel_id, const std::string& before_id = "");
     bool SendDiscordMessage(const std::string& channel_id, const std::string& content);
     bool EditMessage(const std::string& channel_id, const std::string& msg_id, const std::string& new_content);
     bool DeleteMessage(const std::string& channel_id, const std::string& msg_id);
@@ -136,6 +147,8 @@ private:
     // Gateway state
     std::string         m_Token;
     std::string         m_UserId;
+    std::string         m_DisplayName;
+    std::string         m_AvatarHash;
     std::string         m_SessionId;
     int                 m_HeartbeatInterval = 41250;
     int                 m_SequenceNumber    = 0;

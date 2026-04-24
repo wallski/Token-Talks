@@ -39,6 +39,8 @@ void DiscordClient::SetToken(const std::string &token) { m_Token = token; }
 std::string DiscordClient::GetToken() const { return m_Token; }
 
 std::string DiscordClient::GetUserId() const { return m_UserId; }
+std::string DiscordClient::GetUserName() const { return m_DisplayName; }
+std::string DiscordClient::GetUserAvatar() const { return m_AvatarHash; }
 
 bool DiscordClient::ValidateToken(const std::string &token) {
   DiscordClient temp;
@@ -95,8 +97,10 @@ bool DiscordClient::Connect() {
   if (!resp.empty()) {
     try {
       auto j = json::parse(resp);
-      if (j.contains("id"))
-        m_UserId = j["id"].get<std::string>();
+      if (j.contains("id")) m_UserId = j["id"].get<std::string>();
+      if (j.contains("global_name") && !j["global_name"].is_null()) m_DisplayName = j["global_name"].get<std::string>();
+      else if (j.contains("username")) m_DisplayName = j["username"].get<std::string>();
+      if (j.contains("avatar") && !j["avatar"].is_null()) m_AvatarHash = j["avatar"].get<std::string>();
     } catch (...) {
     }
   }
@@ -110,22 +114,21 @@ void DiscordClient::Disconnect() {
   m_Connected = false;
   m_RunHeartbeat = false;
 
-  if (!m_VoiceConn.m_GuildId.empty()) {
-      LeaveVoiceChannel(m_VoiceConn.m_GuildId);
-      std::this_thread::sleep_for(std::chrono::milliseconds(200)); // Give time for goodbye packet
-  }
-
-  std::lock_guard<std::mutex> lock(m_WsMutex);
+  // Close the websocket handle to unblock any pending WinHttp receive calls.
+  // Do NOT join threads here — ExitProcess(0) in RunGUI will terminate them
+  // instantly, which is what we want to avoid the EXE lock on recompile.
+  {
+    std::lock_guard<std::mutex> lock(m_WsMutex);
     if (m_hWebSocket) {
       WinHttpCloseHandle((HINTERNET)m_hWebSocket);
       m_hWebSocket = nullptr;
     }
+  }
 
-  if (m_WsThread.joinable())
-    m_WsThread.join();
-  if (m_HeartbeatThread.joinable())
-    m_HeartbeatThread.join();
+  if (m_WsThread.joinable())      m_WsThread.detach();
+  if (m_HeartbeatThread.joinable()) m_HeartbeatThread.detach();
 }
+
 
 void DiscordClient::SetOnMessageCallback(
     std::function<void(const DiscordMessage &)> cb) {
@@ -217,8 +220,12 @@ std::vector<DiscordGuild> DiscordClient::FetchGuilds() {
     auto j = json::parse(resp);
     if (j.is_array()) {
       for (const auto &item : j) {
-        guilds.push_back(
-            {item["id"].get<std::string>(), item["name"].get<std::string>()});
+        DiscordGuild g;
+        g.id   = item["id"].get<std::string>();
+        g.name = item["name"].get<std::string>();
+        if (item.contains("icon") && !item["icon"].is_null())
+            g.icon_hash = item["icon"].get<std::string>();
+        guilds.push_back(g);
       }
     }
   } catch (...) {
@@ -274,8 +281,14 @@ DiscordClient::FetchChannels(const std::string &guild_id) {
               locked = true;
             }
           }
-          channels.push_back({item["id"].get<std::string>(),
-                              item["name"].get<std::string>(), type, locked});
+          DiscordChannel ch;
+          ch.id        = item["id"].get<std::string>();
+          ch.name      = item["name"].get<std::string>();
+          ch.type      = type;
+          ch.is_locked = locked;
+          ch.position  = item.contains("position") ? item["position"].get<int>() : 0;
+          ch.parent_id = (item.contains("parent_id") && !item["parent_id"].is_null()) ? item["parent_id"].get<std::string>() : "";
+          channels.push_back(ch);
         }
       }
     }
@@ -299,11 +312,15 @@ std::vector<DiscordChannel> DiscordClient::FetchPrivateChannels() {
           name = item["name"].get<std::string>();
         } else if (item.contains("recipients") && item["recipients"].is_array() &&
                    !item["recipients"].empty()) {
-          // Join recipient names for DM/Group DM
+          // Join recipient display names for DM/Group DM
           for (size_t i = 0; i < item["recipients"].size(); ++i) {
-            if (i > 0)
-              name += ", ";
-            name += item["recipients"][i]["username"].get<std::string>();
+            if (i > 0) name += ", ";
+            const auto& rec = item["recipients"][i];
+            // prefer global_name (display name) over username
+            if (rec.contains("global_name") && !rec["global_name"].is_null())
+                name += rec["global_name"].get<std::string>();
+            else
+                name += rec["username"].get<std::string>();
           }
         }
 
@@ -320,10 +337,11 @@ std::vector<DiscordChannel> DiscordClient::FetchPrivateChannels() {
 }
 
 std::vector<DiscordMessage>
-DiscordClient::FetchMessages(const std::string &channel_id) {
+DiscordClient::FetchMessages(const std::string &channel_id, const std::string& before_id) {
   std::vector<DiscordMessage> msgs;
-  std::string resp = HttpRequest("GET", "/api/v9/channels/" + channel_id +
-                                            "/messages?limit=50");
+  std::string endpoint = "/api/v9/channels/" + channel_id + "/messages?limit=50";
+  if(!before_id.empty()) endpoint += "&before=" + before_id;
+  std::string resp = HttpRequest("GET", endpoint);
   if (resp.empty())
     return msgs;
 
@@ -487,11 +505,22 @@ bool DiscordClient::SendAttachment(const std::string &channel_id,
 void DiscordClient::ParseJsonMessage(const json& item, DiscordMessage& dmsg) {
     dmsg.id = item["id"].get<std::string>();
     if (item.contains("author") && !item["author"].is_null()) {
-        if (item["author"].contains("username"))
-            dmsg.author = item["author"]["username"].get<std::string>();
-        if (item["author"].contains("id"))
-            dmsg.author_id = item["author"]["id"].get<std::string>();
+        const auto& au = item["author"];
+        if (au.contains("username"))
+            dmsg.author_username = au["username"].get<std::string>();
+        if (au.contains("id"))
+            dmsg.author_id = au["id"].get<std::string>();
+        if (au.contains("avatar") && !au["avatar"].is_null())
+            dmsg.author_avatar = au["avatar"].get<std::string>();
+        // Prefer global_name (display name) over raw username
+        if (au.contains("global_name") && !au["global_name"].is_null())
+            dmsg.author = au["global_name"].get<std::string>();
+        else
+            dmsg.author = dmsg.author_username;
     }
+
+    if (item.contains("timestamp"))
+        dmsg.timestamp = item["timestamp"].get<std::string>();
 
     if (item.contains("content"))
         dmsg.content = item["content"].get<std::string>();
@@ -607,6 +636,9 @@ void DiscordClient::WebSocketLoop() {
         } else if (op == 0) { // Dispatch
           std::string t = j["t"].get<std::string>();
           if (t == "READY") {
+            // Capture our session_id — required for voice Identify (Op 0)
+            if (j["d"].contains("session_id") && !j["d"]["session_id"].is_null())
+                m_SessionId = j["d"]["session_id"].get<std::string>();
             if (m_ConnectedCallback)
               m_ConnectedCallback();
           } else if (t == "MESSAGE_CREATE") {
@@ -617,9 +649,42 @@ void DiscordClient::WebSocketLoop() {
             }
           } else if (t == "VOICE_STATE_UPDATE") {
             auto d = j["d"];
-            std::string userId = d["user_id"];
-            std::string channelId = d.contains("channel_id") && !d["channel_id"].is_null() ? d["channel_id"].get<std::string>() : "";
-            
+            std::string userId    = d.value("user_id", "");
+            std::string channelId = (d.contains("channel_id") && !d["channel_id"].is_null())
+                                    ? d["channel_id"].get<std::string>() : "";
+            // Try to grab display name and avatar from the embedded member/user object
+            std::string displayName = "User " + userId.substr(0, 4);
+            std::string avatarHash  = "";
+            std::string username    = "";
+            if (d.contains("member") && !d["member"].is_null()) {
+                const auto& mem = d["member"];
+                if (mem.contains("nick") && !mem["nick"].is_null())
+                    displayName = mem["nick"].get<std::string>();
+                if (mem.contains("user") && !mem["user"].is_null()) {
+                    const auto& u = mem["user"];
+                    if (mem["nick"].is_null() || !mem.contains("nick")) {
+                        if (u.contains("global_name") && !u["global_name"].is_null())
+                            displayName = u["global_name"].get<std::string>();
+                        else if (u.contains("username"))
+                            displayName = u["username"].get<std::string>();
+                    }
+                    if (u.contains("avatar") && !u["avatar"].is_null())
+                        avatarHash = u["avatar"].get<std::string>();
+                    if (u.contains("username"))
+                        username = u["username"].get<std::string>();
+                }
+            } else if (d.contains("user") && !d["user"].is_null()) {
+                const auto& u = d["user"];
+                if (u.contains("global_name") && !u["global_name"].is_null())
+                    displayName = u["global_name"].get<std::string>();
+                else if (u.contains("username"))
+                    displayName = u["username"].get<std::string>();
+                if (u.contains("avatar") && !u["avatar"].is_null())
+                    avatarHash = u["avatar"].get<std::string>();
+                if (u.contains("username"))
+                    username = u["username"].get<std::string>();
+            }
+
             std::lock_guard<std::mutex> vl(m_VoiceMutex);
             if (channelId.empty()) {
                 for (auto it = m_VoiceMembers.begin(); it != m_VoiceMembers.end(); ++it) {
@@ -632,18 +697,24 @@ void DiscordClient::WebSocketLoop() {
                 bool found = false;
                 for (auto& m : m_VoiceMembers) {
                     if (m.m_Id == userId) {
-                        m.m_IsMuted = d.value("mute", false) || d.value("self_mute", false);
+                        m.m_IsMuted    = d.value("mute", false) || d.value("self_mute", false);
                         m.m_IsDeafened = d.value("deaf", false) || d.value("self_deaf", false);
+                        m.m_ChannelId  = channelId;
+                        if (!displayName.empty()) m.m_DisplayName = displayName;
+                        if (!avatarHash.empty())  m.m_AvatarHash  = avatarHash;
                         found = true;
                         break;
                     }
                 }
                 if (!found) {
                     VoiceMember vm;
-                    vm.m_Id = userId;
-                    vm.m_Username = "User " + userId.substr(0, 4);
-                    vm.m_IsMuted = d.value("mute", false) || d.value("self_mute", false);
-                    vm.m_IsDeafened = d.value("deaf", false) || d.value("self_deaf", false);
+                    vm.m_Id          = userId;
+                    vm.m_Username    = username.empty() ? ("User " + userId.substr(0,4)) : username;
+                    vm.m_DisplayName = displayName;
+                    vm.m_AvatarHash  = avatarHash;
+                    vm.m_ChannelId   = channelId;
+                    vm.m_IsMuted     = d.value("mute", false) || d.value("self_mute", false);
+                    vm.m_IsDeafened  = d.value("deaf", false) || d.value("self_deaf", false);
                     m_VoiceMembers.push_back(vm);
                 }
             }
@@ -787,47 +858,63 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token, std::stri
 
             if (op == 2) { // READY
                 OutputDebugStringA("[VOICE] Received READY (Op 2)\n");
-                uint32_t ssrc = d["ssrc"];
-                std::string ip = d["ip"];
-                int port = d["port"];
-                    struct addrinfo hints = {0}, *res;
-                    hints.ai_family = AF_INET;
-                    if (getaddrinfo(ip.c_str(), std::to_string(port).c_str(), &hints, &res) == 0) {
-                        m_VoiceConn.m_ServerAddr = *(struct sockaddr_in*)res->ai_addr;
-                        freeaddrinfo(res);
-                    }
-                    unsigned char packet[74] = {0};
-                    *(uint16_t*)(packet) = htons(1);
-                    *(uint16_t*)(packet + 2) = htons(70);
-                    *(uint32_t*)(packet + 4) = htonl(m_VoiceConn.m_Ssrc);
-                    sendto(udpSocket, (char*)packet, 74, 0, (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
-                    struct sockaddr_in from; int fromLen = sizeof(from); char resp[74];
-                    bool discovered = false;
-                    for (int retry = 0; retry < 5 && !discovered; ++retry) {
-                        sendto(udpSocket, (char*)packet, 74, 0, (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
-                        if (recvfrom(udpSocket, resp, 74, 0, (struct sockaddr*)&from, &fromLen) > 0) {
-                            discovered = true;
-                            // Safe IP parsing
-                            char szIp[64] = {0};
-                            for(int k=0; k<64; k++) {
-                                char c = resp[8+k];
-                                if (c == 0) break;
-                                szIp[k] = c;
-                            }
-                            std::string myIp = szIp;
-                            uint16_t myPort = *(uint16_t*)(resp + 72); // discovery returns it in network byte order usually, but let's check
-                            
-                            // Re-verify port extraction: the spec says it's big-endian at the end of the packet sometimes
-                            // but actually for Discord it's usually at 72. 
-                            // Let's use it as provided (host order if we cast directly on little-endian machine)
-                            
-                            json selectP = {{"op", 1}, {"d", {{"protocol", "udp"}, {"data", {{"address", myIp}, {"port", ntohs(myPort)}, {"mode", "xsalsa20_poly1305"}}}}}};
-                            OutputDebugStringA("[VOICE] Discovery Success\n");
-                            std::string sSel = selectP.dump();
-                            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sSel.c_str(), (DWORD)sSel.size());
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Stabilization
+                uint32_t ssrc = d["ssrc"].get<uint32_t>();
+                m_VoiceConn.m_Ssrc = ssrc; // BUG FIX: was never stored
+                std::string ip = d["ip"].get<std::string>();
+                int port       = d["port"].get<int>();
+
+                // BUG FIX: resolve address BEFORE sending any packets
+                struct addrinfo hints = {}, *res = nullptr;
+                hints.ai_family = AF_INET;
+                if (getaddrinfo(ip.c_str(), std::to_string(port).c_str(), &hints, &res) == 0 && res) {
+                    m_VoiceConn.m_ServerAddr = *(struct sockaddr_in*)res->ai_addr;
+                    freeaddrinfo(res);
+                } else {
+                    // Fallback: manual inet_pton
+                    m_VoiceConn.m_ServerAddr = {};
+                    m_VoiceConn.m_ServerAddr.sin_family = AF_INET;
+                    m_VoiceConn.m_ServerAddr.sin_port   = htons((u_short)port);
+                    inet_pton(AF_INET, ip.c_str(), &m_VoiceConn.m_ServerAddr.sin_addr);
+                }
+
+                // IP Discovery packet (type=1, length=70, ssrc)
+                unsigned char packet[74] = {0};
+                *(uint16_t*)(packet)     = htons(1);
+                *(uint16_t*)(packet + 2) = htons(70);
+                *(uint32_t*)(packet + 4) = htonl(ssrc);
+
+                bool discovered = false;
+                for (int retry = 0; retry < 5 && !discovered; ++retry) {
+                    sendto(udpSocket, (char*)packet, 74, 0,
+                           (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
+                    struct sockaddr_in from; int fromLen = sizeof(from); char resp2[74] = {0};
+                    int r = recvfrom(udpSocket, resp2, 74, 0, (struct sockaddr*)&from, &fromLen);
+                    if (r > 0) {
+                        discovered = true;
+                        // Safe IP parsing from discovery response
+                        char szIp[64] = {0};
+                        for (int k = 0; k < 63; k++) {
+                            char c = resp2[8 + k];
+                            if (c == 0) break;
+                            szIp[k] = c;
                         }
+                        std::string myIp  = szIp;
+                        uint16_t myPort   = ntohs(*(uint16_t*)(resp2 + 72));
+                        json selectP = {{"op", 1}, {"d", {{"protocol", "udp"}, {"data", {{"address", myIp}, {"port", (int)myPort}, {"mode", "xsalsa20_poly1305"}}}}}};
+                        OutputDebugStringA("[VOICE] Discovery OK, sending Select Protocol\n");
+                        std::string sSel = selectP.dump();
+                        WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sSel.c_str(), (DWORD)sSel.size());
+                    } else {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     }
+                }
+                if (!discovered) {
+                    // Fallback: send Select Protocol with server IP directly
+                    OutputDebugStringA("[VOICE] Discovery failed, sending fallback Select Protocol\n");
+                    json selectP = {{"op", 1}, {"d", {{"protocol", "udp"}, {"data", {{"address", ip}, {"port", port}, {"mode", "xsalsa20_poly1305"}}}}}};
+                    std::string sSel = selectP.dump();
+                    WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sSel.c_str(), (DWORD)sSel.size());
+                }
                 } else if (op == 4) { // SESSION_DESCRIPTION
                     OutputDebugStringA("[VOICE] Received SESSION_DESCRIPTION (Op 4) - READY!\n");
                     m_VoiceConn.m_SecretKey = d["secret_key"].get<std::vector<uint8_t>>();
