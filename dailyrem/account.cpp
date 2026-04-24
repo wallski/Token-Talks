@@ -1,6 +1,5 @@
 #define NOMINMAX
 #include "account.h"
-#include "functions.h"
 #include <fstream>
 #include <iostream>
 #include <limits>

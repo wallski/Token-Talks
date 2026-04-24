@@ -10,5 +10,4 @@ struct GifEntry {
 void LoadGifs(std::vector<GifEntry>& list);
 void SaveGifs(const std::vector<GifEntry>& list);
 bool UrlLooksAlive(const std::string& url);
-void GifManagerLoop();
 bool FindGifByName(const std::string& name, std::string& url);

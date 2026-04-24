@@ -132,8 +132,6 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="account.cpp" />
-    <ClCompile Include="commands.cpp" />
-    <ClCompile Include="functions.cpp" />
     <ClCompile Include="gif.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="discord_client.cpp" />
@@ -148,8 +146,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="account.h" />
-    <ClInclude Include="commands.h" />
-    <ClInclude Include="functions.h" />
     <ClInclude Include="gif.h" />
     <ClInclude Include="discord_client.h" />
     <ClInclude Include="gui.h" />

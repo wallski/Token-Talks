@@ -176,6 +176,7 @@ private:
     void SendIdentify(void* hWebSocket);
     std::string HttpRequest(const std::string& method, const std::string& path, const std::string& body = "");
     void ParseJsonMessage(const nlohmann::json& item, DiscordMessage& dmsg);
+    void ParseVoiceStateUpdate(const nlohmann::json& d);
 
     std::queue<std::string> m_WsSendQueue;
     std::mutex              m_SendMutex;

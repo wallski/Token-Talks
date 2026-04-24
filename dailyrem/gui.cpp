@@ -1048,10 +1048,15 @@ void DrawMainApp() {
                 if(tf==2){
                     std::lock_guard<std::mutex> vl(gc.m_VoiceMutex);
                     for(auto&vm:gc.m_VoiceMembers)if(vm.m_ChannelId==c.id){
-                        ImGui::SetCursorPosX(22);
-                        ImGui::PushStyleColor(ImGuiCol_Text,{0.38f,0.82f,0.44f,0.9f});
-                        std::string vn=vm.m_DisplayName.empty()?vm.m_Username:vm.m_DisplayName;
-                        ImGui::TextUnformatted(("  * "+vn).c_str());
+                        ImGui::SetCursorPosX(28);
+                        ImVec2 p0 = ImGui::GetCursorScreenPos();
+                        ImGui::Dummy({20, 20});
+                        DrawAvatarCircle(cDL, {p0.x + 10, p0.y + 10}, 10.f, vm.m_Id, vm.m_AvatarHash, vm.m_DisplayName.empty() ? vm.m_Username : vm.m_DisplayName);
+                        ImGui::SameLine(54);
+                        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 2);
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.67f, 0.70f, 1.0f));
+                        std::string vn = vm.m_DisplayName.empty() ? vm.m_Username : vm.m_DisplayName;
+                        ImGui::TextUnformatted(vn.c_str());
                         ImGui::PopStyleColor();
                     }
                 }
