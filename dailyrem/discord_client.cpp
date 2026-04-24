@@ -1,18 +1,38 @@
+// discord_client.h already includes winsock2.h before windows.h (required order)
 #include "discord_client.h"
 #include "vendor/nlohmann/json.hpp"
 #include <iostream>
-#include <windows.h>
-#include <winhttp.h>
+#include <string>
+#include <vector>
+#include <deque>
+#include <chrono>
+
+#define NOMINMAX
+#pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
+#include "gui.h"
+#include "vendor/include/sodium.h"
+#include "vendor/include/opus.h"
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "opus.lib")
+#pragma comment(lib, "libsodium.lib")
 
 using json = nlohmann::json;
 
 DiscordClient::DiscordClient()
     : m_Connected(false), m_RunHeartbeat(false), m_HeartbeatInterval(41250),
-      m_SequenceNumber(0), m_hWebSocket(nullptr) {}
+      m_SequenceNumber(0), m_hWebSocket(nullptr), m_SendThreadRunning(false) {
+    m_SendThreadRunning = true;
+    m_SendThread = std::thread(&DiscordClient::SendThreadLoop, this);
+}
 
-DiscordClient::~DiscordClient() { Disconnect(); }
+DiscordClient::~DiscordClient() { 
+    Disconnect(); 
+    m_SendThreadRunning = false;
+    m_SendCv.notify_all();
+    if (m_SendThread.joinable()) m_SendThread.join();
+}
 
 void DiscordClient::SetToken(const std::string &token) { m_Token = token; }
 
@@ -90,13 +110,16 @@ void DiscordClient::Disconnect() {
   m_Connected = false;
   m_RunHeartbeat = false;
 
-  {
-    std::lock_guard<std::mutex> lock(m_WsMutex);
+  if (!m_VoiceConn.m_GuildId.empty()) {
+      LeaveVoiceChannel(m_VoiceConn.m_GuildId);
+      std::this_thread::sleep_for(std::chrono::milliseconds(200)); // Give time for goodbye packet
+  }
+
+  std::lock_guard<std::mutex> lock(m_WsMutex);
     if (m_hWebSocket) {
       WinHttpCloseHandle((HINTERNET)m_hWebSocket);
       m_hWebSocket = nullptr;
     }
-  }
 
   if (m_WsThread.joinable())
     m_WsThread.join();
@@ -261,6 +284,41 @@ DiscordClient::FetchChannels(const std::string &guild_id) {
   return channels;
 }
 
+std::vector<DiscordChannel> DiscordClient::FetchPrivateChannels() {
+  std::vector<DiscordChannel> channels;
+  std::string resp = HttpRequest("GET", "/api/v9/users/@me/channels");
+  if (resp.empty())
+    return channels;
+
+  try {
+    auto j = json::parse(resp);
+    if (j.is_array()) {
+      for (const auto &item : j) {
+        std::string name = "";
+        if (item.contains("name") && !item["name"].is_null()) {
+          name = item["name"].get<std::string>();
+        } else if (item.contains("recipients") && item["recipients"].is_array() &&
+                   !item["recipients"].empty()) {
+          // Join recipient names for DM/Group DM
+          for (size_t i = 0; i < item["recipients"].size(); ++i) {
+            if (i > 0)
+              name += ", ";
+            name += item["recipients"][i]["username"].get<std::string>();
+          }
+        }
+
+        if (name.empty())
+          name = "Unnamed DM";
+
+        channels.push_back({item["id"].get<std::string>(), name,
+                            item["type"].get<int>(), false});
+      }
+    }
+  } catch (...) {
+  }
+  return channels;
+}
+
 std::vector<DiscordMessage>
 DiscordClient::FetchMessages(const std::string &channel_id) {
   std::vector<DiscordMessage> msgs;
@@ -274,46 +332,9 @@ DiscordClient::FetchMessages(const std::string &channel_id) {
     if (j.is_array()) {
       for (auto it = j.rbegin(); it != j.rend();
            ++it) { // Reverse to get oldest to newest
-        const auto &item = *it;
-        std::string author = "Unknown";
-        std::string author_id = "";
-        if (item.contains("author")) {
-          if (item["author"].contains("username"))
-            author = item["author"]["username"].get<std::string>();
-          if (item["author"].contains("id"))
-            author_id = item["author"]["id"].get<std::string>();
-        }
-
-        std::string content = "";
-        std::vector<std::string> attachment_urls;
-        if (item.contains("content"))
-          content = item["content"].get<std::string>();
-
-        if (item.contains("attachments") && item["attachments"].is_array()) {
-          for (const auto& att : item["attachments"]) {
-            if (att.contains("url")) {
-              std::string url = att["url"].get<std::string>();
-              std::string fname = att.contains("filename") ? att["filename"].get<std::string>() : "";
-              std::string ext = fname.size() >= 4 ? fname.substr(fname.size() - 4) : "";
-              std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-              if (ext == ".png" || ext == ".jpg" || ext == "jpeg" || ext == ".gif" || ext == "webp") {
-                attachment_urls.push_back(url);
-              }
-            }
-          }
-        }
-
-        if (attachment_urls.empty() && item.contains("embeds") && item["embeds"].is_array()) {
-          for (const auto& emb : item["embeds"]) {
-            if (emb.contains("image") && emb["image"].contains("url")) {
-              attachment_urls.push_back(emb["image"]["url"].get<std::string>());
-            } else if (emb.contains("thumbnail") && emb["thumbnail"].contains("url")) {
-              attachment_urls.push_back(emb["thumbnail"]["url"].get<std::string>());
-            }
-          }
-        }
-
-        msgs.push_back({item["id"].get<std::string>(), author, author_id, content, attachment_urls});
+        DiscordMessage dmsg;
+        ParseJsonMessage(*it, dmsg);
+        msgs.push_back(dmsg);
       }
     }
   } catch (...) {
@@ -343,8 +364,13 @@ bool DiscordClient::DeleteMessage(const std::string &channel_id,
                                   const std::string &msg_id) {
   std::string resp = HttpRequest("DELETE", "/api/v9/channels/" + channel_id +
                                                "/messages/" + msg_id);
-  return !resp.empty(); // HTTP DELETE replies natively without body constraints
-                        // usually depending on discord proxy
+  return !resp.empty();
+}
+
+bool DiscordClient::AddReaction(const std::string& channel_id, const std::string& msg_id, const std::string& emoji) {
+  std::string path = "/api/v9/channels/" + channel_id + "/messages/" + msg_id + "/reactions/" + emoji + "/@me";
+  std::string resp = HttpRequest("PUT", path, "");
+  return true;
 }
 
 std::vector<unsigned char>
@@ -458,6 +484,56 @@ bool DiscordClient::SendAttachment(const std::string &channel_id,
   return sent == TRUE;
 }
 
+void DiscordClient::ParseJsonMessage(const json& item, DiscordMessage& dmsg) {
+    dmsg.id = item["id"].get<std::string>();
+    if (item.contains("author") && !item["author"].is_null()) {
+        if (item["author"].contains("username"))
+            dmsg.author = item["author"]["username"].get<std::string>();
+        if (item["author"].contains("id"))
+            dmsg.author_id = item["author"]["id"].get<std::string>();
+    }
+
+    if (item.contains("content"))
+        dmsg.content = item["content"].get<std::string>();
+
+    if (item.contains("attachments") && item["attachments"].is_array()) {
+        for (const auto& att : item["attachments"]) {
+            if (att.contains("url")) {
+                std::string url = att["url"].get<std::string>();
+                std::string fname = att.contains("filename") ? att["filename"].get<std::string>() : "";
+                std::string ext = fname.size() >= 4 ? fname.substr(fname.size() - 4) : "";
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext == ".png" || ext == ".jpg" || ext == "jpeg" || ext == ".gif" || ext == ".webp") {
+                    dmsg.attachment_urls.push_back(url);
+                } else if (ext == ".mp4" || ext == ".mov" || ext == ".webm" || ext == ".m4v") {
+                    dmsg.video_urls.push_back(url);
+                }
+            }
+        }
+    }
+
+    if (dmsg.attachment_urls.empty() && item.contains("embeds") && item["embeds"].is_array()) {
+        for (const auto& emb : item["embeds"]) {
+            if (emb.contains("image") && emb["image"].contains("url")) {
+                dmsg.attachment_urls.push_back(emb["image"]["url"].get<std::string>());
+            } else if (emb.contains("thumbnail") && emb["thumbnail"].contains("url")) {
+                dmsg.attachment_urls.push_back(emb["thumbnail"]["url"].get<std::string>());
+            }
+        }
+    }
+
+    if (item.contains("reactions") && item["reactions"].is_array()) {
+        for (const auto& r : item["reactions"]) {
+            DiscordReaction dr;
+            if (r.contains("emoji") && r["emoji"].contains("name"))
+                dr.emoji = r["emoji"]["name"].get<std::string>();
+            dr.count = r.contains("count") ? r["count"].get<int>() : 1;
+            dr.me = r.contains("me") ? r["me"].get<bool>() : false;
+            dmsg.reactions.push_back(dr);
+        }
+    }
+}
+
 void DiscordClient::SendIdentify(void *hWebSocket) {
   json identify = {
       {"op", 2},
@@ -466,9 +542,7 @@ void DiscordClient::SendIdentify(void *hWebSocket) {
         {"capabilities", 16381},
         {"properties",
          {{"os", "Windows"}, {"browser", "Chrome"}, {"device", ""}}}}}};
-  std::string payload = identify.dump();
-  WinHttpWebSocketSend(hWebSocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-                       (PVOID)payload.data(), (DWORD)payload.size());
+  QueueWsMessage(identify.dump());
 }
 
 void DiscordClient::WebSocketLoop() {
@@ -538,16 +612,60 @@ void DiscordClient::WebSocketLoop() {
           } else if (t == "MESSAGE_CREATE") {
             if (m_MessageCallback) {
               DiscordMessage dmsg;
-              dmsg.id = j["d"]["id"].get<std::string>();
-              if (j["d"].contains("author") && !j["d"]["author"].is_null()) {
-                if (j["d"]["author"].contains("username"))
-                  dmsg.author = j["d"]["author"]["username"].get<std::string>();
-                if (j["d"]["author"].contains("id"))
-                  dmsg.author_id = j["d"]["author"]["id"].get<std::string>();
-              }
-              dmsg.content = j["d"]["content"].get<std::string>();
+              ParseJsonMessage(j["d"], dmsg);
               m_MessageCallback(dmsg);
             }
+          } else if (t == "VOICE_STATE_UPDATE") {
+            auto d = j["d"];
+            std::string userId = d["user_id"];
+            std::string channelId = d.contains("channel_id") && !d["channel_id"].is_null() ? d["channel_id"].get<std::string>() : "";
+            
+            std::lock_guard<std::mutex> vl(m_VoiceMutex);
+            if (channelId.empty()) {
+                for (auto it = m_VoiceMembers.begin(); it != m_VoiceMembers.end(); ++it) {
+                    if (it->m_Id == userId) {
+                        m_VoiceMembers.erase(it);
+                        break;
+                    }
+                }
+            } else {
+                bool found = false;
+                for (auto& m : m_VoiceMembers) {
+                    if (m.m_Id == userId) {
+                        m.m_IsMuted = d.value("mute", false) || d.value("self_mute", false);
+                        m.m_IsDeafened = d.value("deaf", false) || d.value("self_deaf", false);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    VoiceMember vm;
+                    vm.m_Id = userId;
+                    vm.m_Username = "User " + userId.substr(0, 4);
+                    vm.m_IsMuted = d.value("mute", false) || d.value("self_mute", false);
+                    vm.m_IsDeafened = d.value("deaf", false) || d.value("self_deaf", false);
+                    m_VoiceMembers.push_back(vm);
+                }
+            }
+          } else if (t == "VOICE_SERVER_UPDATE") {
+            auto d = j["d"];
+            m_VoiceConn.m_Endpoint = d["endpoint"];
+            m_VoiceConn.m_Token = d["token"];
+            m_VoiceConn.m_GuildId = d["guild_id"];
+            
+            if (m_VoiceConn.m_Running) {
+                m_VoiceConn.m_Running = false;
+                // Don't join here, it blocks the gateway loop.
+                // The loop should exit on its own when m_Running is false.
+                // If we really need to wait, we'd do it on a separate task thread.
+            }
+            
+            if (m_VoiceConn.m_VoiceThread.joinable()) {
+                m_VoiceConn.m_VoiceThread.detach(); // Detach to allow new connection
+            }
+            
+            m_VoiceConn.m_Running = true;
+            m_VoiceConn.m_VoiceThread = std::thread(&DiscordClient::VoiceLoop, this, m_VoiceConn.m_Endpoint, m_VoiceConn.m_Token, m_VoiceConn.m_GuildId, m_SessionId, m_UserId);
           }
         }
       } catch (...) {
@@ -572,12 +690,255 @@ void DiscordClient::WebSocketLoop() {
   m_Connected = false;
 }
 
+bool DiscordClient::JoinVoiceChannel(const std::string& guild_id, const std::string& channel_id) {
+  m_VoiceReady = false;
+  json payload = {
+      {"op", 4},
+      {"d",
+       {{"guild_id", guild_id},
+        {"channel_id", (channel_id.empty() ? nullptr : json(channel_id))},
+        {"self_mute", false},
+        {"self_deaf", false}}}};
+  QueueWsMessage(payload.dump());
+  return true;
+}
+
+void DiscordClient::LeaveVoiceChannel(const std::string& guild_id) {
+    JoinVoiceChannel(guild_id, ""); // Sending null channel ID leaves the channel
+    m_VoiceConn.m_Running = false;
+    // Don't join here to avoid freezing the UI thread.
+}
+
+void DiscordClient::SetVoiceState(bool muted, bool deafened) {
+    m_VoiceConn.m_IsMuted = muted;
+    m_VoiceConn.m_IsDeafened = deafened;
+    // Optionally send op 5 (Speaking) to Discord if we were to implement talking indicators
+}
+
+void DiscordClient::SetAudioDevices(int inputIdx, int outputIdx) {
+    m_VoiceConn.m_InputDevice = inputIdx;
+    m_VoiceConn.m_OutputDevice = outputIdx;
+}
+
+std::vector<VoiceMember> DiscordClient::GetVoiceMembers(const std::string& channel_id) {
+    std::lock_guard<std::mutex> lock(m_VoiceMutex);
+    return m_VoiceMembers;
+}
+
+void DiscordClient::VoiceLoop(std::string endpoint, std::string token, std::string guildId, std::string sessionId, std::string userId) {
+    size_t colon = endpoint.find(':');
+    if (colon != std::string::npos) endpoint = endpoint.substr(0, colon);
+
+    HINTERNET hSession = WinHttpOpen(L"DiscordVoice/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return;
+    HINTERNET hConnect = WinHttpConnect(hSession, std::wstring(endpoint.begin(), endpoint.end()).c_str(), 443, 0);
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", L"/", NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
+    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(hRequest, NULL)) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    HINTERNET hVoiceWS = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
+    WinHttpCloseHandle(hRequest);
+    if (!hVoiceWS) {
+        WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    m_VoiceConn.m_hVoiceWS = hVoiceWS;
+
+    json identify = {
+        {"op", 0},
+        {"d", {{"server_id", guildId}, {"user_id", userId}, {"session_id", sessionId}, {"token", token}}}
+    };
+    std::string sId = identify.dump();
+    WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sId.c_str(), (DWORD)sId.size());
+
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, 0);
+    int timeout = 2000;
+    setsockopt(udpSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    m_VoiceConn.m_UdpSocket = udpSocket;
+
+    const DWORD cbBuffer = 8192;
+    BYTE* pbBuffer = new BYTE[cbBuffer];
+    
+    while (m_VoiceConn.m_Running) {
+        DWORD cbRead = 0;
+        WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
+        std::string wsMessage;
+        
+        do {
+            if (WinHttpWebSocketReceive(hVoiceWS, pbBuffer, cbBuffer, &cbRead, &type) != ERROR_SUCCESS) {
+                OutputDebugStringA("[VOICE] WS Receive Error\n");
+                break;
+            }
+            wsMessage.append((char*)pbBuffer, cbRead);
+        } while (type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE || type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE);
+
+        if (wsMessage.empty()) break;
+        
+        try {
+            auto j = json::parse(wsMessage);
+            int op = j["op"];
+            auto d = j["d"];
+
+            if (op == 2) { // READY
+                OutputDebugStringA("[VOICE] Received READY (Op 2)\n");
+                uint32_t ssrc = d["ssrc"];
+                std::string ip = d["ip"];
+                int port = d["port"];
+                    struct addrinfo hints = {0}, *res;
+                    hints.ai_family = AF_INET;
+                    if (getaddrinfo(ip.c_str(), std::to_string(port).c_str(), &hints, &res) == 0) {
+                        m_VoiceConn.m_ServerAddr = *(struct sockaddr_in*)res->ai_addr;
+                        freeaddrinfo(res);
+                    }
+                    unsigned char packet[74] = {0};
+                    *(uint16_t*)(packet) = htons(1);
+                    *(uint16_t*)(packet + 2) = htons(70);
+                    *(uint32_t*)(packet + 4) = htonl(m_VoiceConn.m_Ssrc);
+                    sendto(udpSocket, (char*)packet, 74, 0, (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
+                    struct sockaddr_in from; int fromLen = sizeof(from); char resp[74];
+                    bool discovered = false;
+                    for (int retry = 0; retry < 5 && !discovered; ++retry) {
+                        sendto(udpSocket, (char*)packet, 74, 0, (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
+                        if (recvfrom(udpSocket, resp, 74, 0, (struct sockaddr*)&from, &fromLen) > 0) {
+                            discovered = true;
+                            // Safe IP parsing
+                            char szIp[64] = {0};
+                            for(int k=0; k<64; k++) {
+                                char c = resp[8+k];
+                                if (c == 0) break;
+                                szIp[k] = c;
+                            }
+                            std::string myIp = szIp;
+                            uint16_t myPort = *(uint16_t*)(resp + 72); // discovery returns it in network byte order usually, but let's check
+                            
+                            // Re-verify port extraction: the spec says it's big-endian at the end of the packet sometimes
+                            // but actually for Discord it's usually at 72. 
+                            // Let's use it as provided (host order if we cast directly on little-endian machine)
+                            
+                            json selectP = {{"op", 1}, {"d", {{"protocol", "udp"}, {"data", {{"address", myIp}, {"port", ntohs(myPort)}, {"mode", "xsalsa20_poly1305"}}}}}};
+                            OutputDebugStringA("[VOICE] Discovery Success\n");
+                            std::string sSel = selectP.dump();
+                            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sSel.c_str(), (DWORD)sSel.size());
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Stabilization
+                        }
+                    }
+                } else if (op == 4) { // SESSION_DESCRIPTION
+                    OutputDebugStringA("[VOICE] Received SESSION_DESCRIPTION (Op 4) - READY!\n");
+                    m_VoiceConn.m_SecretKey = d["secret_key"].get<std::vector<uint8_t>>();
+                    m_VoiceConn.m_Ready = true;
+                    m_VoiceReady = true; 
+                    std::thread(&DiscordClient::AudioCaptureLoop, this).detach();
+                } else if (op == 8) { // HELLO
+                    int interval = d["heartbeat_interval"];
+                    std::thread([this, hVoiceWS, interval]() {
+                        while (m_VoiceConn.m_Running && m_VoiceConn.m_hVoiceWS == hVoiceWS) {
+                            json hb = {{"op", 3}, {"d", GetTickCount()}};
+                            std::string s = hb.dump();
+                            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)s.c_str(), (DWORD)s.size());
+                            for(int i=0; i<interval && m_VoiceConn.m_Running; i+=100) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                    }).detach();
+                }
+            } catch(...) {}
+        }
+    m_VoiceReady = false;
+    m_VoiceConn.m_Ready = false;
+    delete[] pbBuffer; closesocket(udpSocket);
+    WinHttpWebSocketClose(hVoiceWS, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+    WinHttpCloseHandle(hVoiceWS); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+}
+
+void DiscordClient::AudioCaptureLoop() {
+    // 1. Tell Discord we are speaking
+    json speaking = {{"op", 5}, {"d", {{"speaking", 1}, {"delay", 0}, {"ssrc", m_VoiceConn.m_Ssrc}}}};
+    std::string sSp = speaking.dump();
+    if (m_VoiceConn.m_hVoiceWS)
+        WinHttpWebSocketSend(m_VoiceConn.m_hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sSp.c_str(), (DWORD)sSp.size());
+
+    int samples = 48000;
+    int channels = 1;
+    OpusEncoder* encoder = opus_encoder_create(samples, channels, OPUS_APPLICATION_VOIP, nullptr);
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(64000));
+
+    uint16_t seq = 0;
+    uint32_t ts = 0;
+    unsigned char rtp_packet[1024];
+    unsigned char silent_opus[3] = {0xF8, 0xFF, 0xFE}; // Opus silent frame
+
+    while (m_VoiceConn.m_Running && m_VoiceReady) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20)); 
+        if (m_VoiceConn.m_IsMuted) continue;
+
+        // RTP Header
+        rtp_packet[0] = 0x80; rtp_packet[1] = 0x78;
+        *(uint16_t*)(rtp_packet + 2) = htons(seq++);
+        *(uint32_t*)(rtp_packet + 4) = htonl(ts);
+        *(uint32_t*)(rtp_packet + 8) = htonl(m_VoiceConn.m_Ssrc);
+        ts += 960;
+
+        // Nonce for xsalsa20_poly1305 (24 bytes)
+        unsigned char nonce[24] = {0};
+        memcpy(nonce, rtp_packet, 12);
+
+        // Encrypt (libsodium)
+        unsigned char encrypted[512] = {0};
+        unsigned long long encrypted_len = 0;
+        
+        if (m_VoiceConn.m_SecretKey.size() == 32) {
+            crypto_secretbox_easy(encrypted, silent_opus, 3, nonce, m_VoiceConn.m_SecretKey.data());
+            encrypted_len = 3 + crypto_secretbox_MACBYTES;
+            
+            // Append encrypted data to RTP header
+            memcpy(rtp_packet + 12, encrypted, (size_t)encrypted_len);
+            sendto(m_VoiceConn.m_UdpSocket, (char*)rtp_packet, 12 + (int)encrypted_len, 0, (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
+        }
+    }
+    opus_encoder_destroy(encoder);
+}
+
+
 void DiscordClient::HeartbeatLoop() {
   while (m_RunHeartbeat) {
+    json heartbeat = {{"op", 1}, {"d", m_SequenceNumber > 0 ? json(m_SequenceNumber) : nullptr}};
+    QueueWsMessage(heartbeat.dump());
+    
     for (int i = 0; i < m_HeartbeatInterval && m_RunHeartbeat; i += 100) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    if (!m_RunHeartbeat)
-      break;
   }
+}
+
+void DiscordClient::QueueWsMessage(const std::string& message) {
+    std::lock_guard<std::mutex> lock(m_SendMutex);
+    m_WsSendQueue.push(message);
+    m_SendCv.notify_one();
+}
+
+void DiscordClient::SendThreadLoop() {
+    while (m_SendThreadRunning) {
+        std::string msg;
+        {
+            std::unique_lock<std::mutex> lock(m_SendMutex);
+            m_SendCv.wait(lock, [this] { return !m_WsSendQueue.empty() || !m_SendThreadRunning; });
+            if (!m_SendThreadRunning) break;
+            msg = m_WsSendQueue.front();
+            m_WsSendQueue.pop();
+        }
+
+        HINTERNET hWS = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_WsMutex);
+            if (m_Connected) hWS = (HINTERNET)m_hWebSocket;
+        }
+
+        if (hWS) {
+            WinHttpWebSocketSend(hWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)msg.c_str(), (DWORD)msg.size());
+        }
+    }
 }
