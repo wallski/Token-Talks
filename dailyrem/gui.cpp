@@ -84,6 +84,8 @@ static std::vector<std::string> g_ComposeFiles;
 static bool g_ComposeOpen = false;
 static bool g_IsFetchingMessages = false;
 static bool g_RefocusInput = false;
+static bool g_WasAtTop = false;       // edge-detect for infinite scroll
+static std::string g_RestoreMsgId = ""; // exactly anchor the scroll when prepending
 
 static std::vector<std::string> g_InputDevices;
 static std::vector<std::string> g_OutputDevices;
@@ -190,6 +192,9 @@ void ApplyTheme(int theme) {
     style.GrabRounding = 6.0f;
     style.ChildRounding = 6.0f;
     style.ScrollbarRounding = 6.0f;
+
+    // Remove blue outline from keyboard/tab navigation
+    style.Colors[ImGuiCol_NavHighlight] = ImVec4(0, 0, 0, 0);
 }
 
 struct HTTPTexture {
@@ -532,7 +537,10 @@ void DrawDashboard() {
                 gc.SetOnMessageCallback(OnDiscordMessage);
                 gc.Connect();
                 g_IsLoggedIn = true;
-                std::thread([]() { RefreshGuilds(); }).detach();
+                std::thread([]() {
+                    RefreshGuilds();
+                    RefreshPrivateChannels(); // show DMs immediately on login
+                }).detach();
             }
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
@@ -1098,8 +1106,12 @@ void DrawMainApp() {
         // Messages — height leaves room for input bar + optional compose staging
         float inputAreaH = 54.f;
         if (g_ComposeOpen && !g_ComposeFiles.empty()) inputAreaH += 68.f;
-        ImGui::BeginChild("##msgs",{0,-inputAreaH},false);
-        if (ImGui::GetScrollY() < 50.0f && !g_IsFetchingMessages && !g_SelectedChannelId.empty()) {
+        ImGui::BeginChild("##msgs",{0,-inputAreaH},false,ImGuiWindowFlags_NoNav);
+
+        // Infinite scroll: trigger only on the LEADING EDGE of reaching the top (not every frame)
+        float curScroll = ImGui::GetScrollY();
+        bool isAtTop = (curScroll < 60.f);
+        if (isAtTop && !g_WasAtTop && !g_IsFetchingMessages && !g_SelectedChannelId.empty()) {
             bool hasMessages = false; std::string firstId;
             { std::lock_guard<std::mutex> lk(g_ChatMutex); if(!g_Messages.empty()){ hasMessages=true; firstId=g_Messages[0].id; } }
             if (hasMessages) {
@@ -1111,13 +1123,14 @@ void DrawMainApp() {
                         std::lock_guard<std::mutex> lock(g_ChatMutex);
                         if(g_SelectedChannelId == ch) {
                             g_Messages.insert(g_Messages.begin(), old_msgs.begin(), old_msgs.end());
-                            // ImGui doesn't preserve scroll when elements are prepended, but this achieves pagination.
+                            g_RestoreMsgId = firstId; // Anchor exactly to the old top message
                         }
                     }
                     g_IsFetchingMessages = false;
                 }).detach();
             }
         }
+        g_WasAtTop = isAtTop;
         {
             std::lock_guard<std::mutex> lock(g_ChatMutex);
             ImDrawList* dl=ImGui::GetWindowDrawList();
@@ -1125,6 +1138,10 @@ void DrawMainApp() {
             float aw=ImGui::GetContentRegionAvail().x;
             std::string prevAid;
             for(auto&m:g_Messages){
+                if (m.id == g_RestoreMsgId) {
+                    ImGui::SetScrollHereY(0.0f); // 0.0 = top alignment
+                    g_RestoreMsgId = "";
+                }
                 bool same=(m.author_id==prevAid);prevAid=m.author_id;
                 if(!same){
                     ImGui::Dummy({0,8});
