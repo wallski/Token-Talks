@@ -501,191 +501,142 @@ void OnDiscordMessage(const DiscordMessage& msg) {
 }
 
 void DrawDashboard() {
-    ImVec2 vp = ImGui::GetMainViewport()->Size;
+    ImVec2 vp_size = ImGui::GetMainViewport()->Size;
     ImVec2 vp_pos = ImGui::GetMainViewport()->Pos;
+
+    // 100% Seamless full-screen window
     ImGui::SetNextWindowPos(vp_pos);
-    ImGui::SetNextWindowSize(vp);
+    ImGui::SetNextWindowSize(vp_size);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(54, 57, 63, 255));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    
     ImGui::Begin("Dashboard", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
-    float panelW = (std::max)(280.0f, (std::min)(vp.x * 0.38f, 440.0f));
-
-    float panelX = (vp.x - panelW) * 0.5f;
-    float startY = vp.y * 0.12f;
-
-    ImGui::SetCursorPos(ImVec2(panelX, startY));
+    // --- LEFT SIDEBAR (SAVED ACCOUNTS) ---
+    float sidebarW = 240.0f;
+    ImGui::SetCursorPos({20, 40});
     ImGui::BeginGroup();
+    ImGui::TextDisabled("SAVED ACCOUNTS");
+    ImGui::Dummy({0, 10});
 
-    ImVec2 subSize = ImGui::CalcTextSize("welcome to");
-    ImGui::SetCursorPosX(panelX + panelW * 0.5f - subSize.x * 0.5f);
-    ImGui::TextDisabled("welcome to");
-
-    ImGui::SetWindowFontScale(2.2f);
-    ImVec2 mainTitleSize = ImGui::CalcTextSize("Token-Talks");
-    ImGui::SetCursorPosX(panelX + panelW * 0.5f - mainTitleSize.x * 0.5f);
-    ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.94f, 1.0f), "Token-Talks");
-    ImGui::SetWindowFontScale(1.0f);
-    ImGui::Dummy(ImVec2(0, 14));
-
-    ImGui::SetCursorPosX(panelX);
-    ImGui::BeginChild("AccountList", ImVec2(panelW, 170), true);
-    auto drawAccountRow = [&](std::vector<Account>& list, bool ismail) {
+    auto drawAccounts = [&](std::vector<Account>& list, bool isMail) {
         for (size_t i = 0; i < list.size(); ++i) {
-            ImGui::PushID((ismail ? 10000 : 0) + (int)i);
-            std::string label = (ismail ? "[M] " : "[T] ") + list[i].name;
-            if (ImGui::Button(label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x - 38, 32))) {
+            ImGui::PushID((isMail ? 20000 : 10000) + (int)i);
+            if (ImGui::Button(list[i].name.c_str(), {sidebarW - 50, 40})) {
                 gc.SetToken(list[i].token);
-                gc.SetOnMessageCallback(OnDiscordMessage);
                 gc.Connect();
                 g_IsLoggedIn = true;
-                std::thread([]() {
-                    RefreshGuilds();
-                    RefreshPrivateChannels(); // show DMs immediately on login
-                }).detach();
+                std::thread([]() { RefreshGuilds(); RefreshPrivateChannels(); }).detach();
             }
             ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
-            if (ImGui::Button("X", ImVec2(32, 32))) {
+            if (ImGui::Button("X", {32, 40})) {
                 list.erase(list.begin() + i);
-                if (ismail) SaveMailAccounts(list); else SaveTokenAccounts(list);
-                ImGui::PopStyleColor(2); ImGui::PopID(); break;
+                if (isMail) SaveMailAccounts(list); else SaveTokenAccounts(list);
+                ImGui::PopID(); break;
             }
-            ImGui::PopStyleColor(2);
             ImGui::PopID();
         }
     };
-    drawAccountRow(g_TokenAccounts, false);
-    drawAccountRow(g_MailAccounts, true);
-    ImGui::EndChild();
+    drawAccounts(g_TokenAccounts, false);
+    drawAccounts(g_MailAccounts, true);
+    ImGui::EndGroup();
 
-    ImGui::Dummy(ImVec2(0, 8));
-    ImGui::SetCursorPosX(panelX);
+    // --- CENTER LOGIN SECTION ---
+    float panelW = 400.0f;
+    float startX = (vp_size.x - panelW) * 0.5f;
+    float startY = vp_size.y * 0.20f;
 
+    ImGui::SetCursorPos({startX, startY});
+    ImGui::BeginGroup();
+
+    // Title text
+    const char* title = "Token-Talks";
+    ImGui::SetCursorPosX(startX + (panelW - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::TextColored(ImVec4(0.35f, 0.40f, 0.94f, 1.0f), title);
+    ImGui::Dummy({0, 40});
+
+    // Clip the TabBar underline
+    ImVec2 clipMin = { startX, vp_pos.y };
+    ImVec2 clipMax = { startX + panelW, vp_pos.y + vp_size.y };
+    ImGui::PushClipRect(clipMin, clipMax, true);
     ImGui::PushItemWidth(panelW);
-    ImGui::BeginChild("LoginTabChild", ImVec2(panelW, 220), false);
-    if (ImGui::BeginTabBar("##AddTabs")) {
 
+    if (ImGui::BeginTabBar("LoginTabs")) {
         if (ImGui::BeginTabItem("Token Login")) {
-            static char newName[128] = "";
-            static char newToken[256] = "";
-            ImGui::Dummy(ImVec2(0, 6));
-            ImGui::InputTextWithHint("##TName", "Account Name", newName, sizeof(newName));
-            ImGui::InputTextWithHint("##TToken", "Discord Token", newToken, sizeof(newToken), ImGuiInputTextFlags_Password);
-            if (ImGui::Button("Add Token Account", ImVec2(panelW, 32))) {
-                if (strlen(newName) > 0 && strlen(newToken) > 0) {
-                    if (DiscordClient::ValidateToken(newToken)) {
-                        Account acc = { newName, newToken, AccountType::TOKEN };
-                        g_TokenAccounts.push_back(acc);
-                        SaveTokenAccounts(g_TokenAccounts);
-                        memset(newName, 0, sizeof(newName));
-                        memset(newToken, 0, sizeof(newToken));
-                        g_TokenError = "";
-                    } else { g_TokenError = "Invalid token — could not verify with Discord."; }
+            static char tName[128] = "", tTok[256] = "";
+            ImGui::Dummy({0, 10});
+            ImGui::SetCursorPosX(startX); ImGui::TextDisabled("DISPLAY NAME");
+            ImGui::SetCursorPosX(startX); ImGui::InputText("##tn", tName, 128);
+            ImGui::SetCursorPosX(startX); ImGui::TextDisabled("TOKEN");
+            ImGui::SetCursorPosX(startX); ImGui::InputText("##tt", tTok, 256, ImGuiInputTextFlags_Password);
+            ImGui::Dummy({0, 20});
+            ImGui::SetCursorPosX(startX);
+            if (ImGui::Button("Log In with Token", {panelW, 45})) {
+                if (strlen(tName) > 0 && DiscordClient::ValidateToken(tTok)) {
+                    g_TokenAccounts.push_back({tName, tTok, AccountType::TOKEN});
+                    SaveTokenAccounts(g_TokenAccounts);
+                    gc.SetToken(tTok); gc.Connect(); g_IsLoggedIn = true;
+                    std::thread([]() { RefreshGuilds(); RefreshPrivateChannels(); }).detach();
                 }
             }
-            if (!g_TokenError.empty())
-                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", g_TokenError.c_str());
             ImGui::EndTabItem();
         }
-
         if (ImGui::BeginTabItem("Email Login")) {
-            static char newName[128] = "";
-            static char newEmail[256] = "";
-            static char newPass[256] = "";
-            ImGui::Dummy(ImVec2(0, 4));
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.5f, 0.25f, 0.0f, 0.3f));
-            ImGui::BeginChild("TosWarn", ImVec2(panelW, 34), false);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "  ! Violates Discord ToS — use at your own risk.");
-            ImGui::EndChild();
-            ImGui::PopStyleColor();
-            ImGui::Dummy(ImVec2(0, 4));
-            ImGui::InputTextWithHint("##MName", "Display Name", newName, sizeof(newName));
-            ImGui::InputTextWithHint("##MEmail", "Email", newEmail, sizeof(newEmail));
-            ImGui::InputTextWithHint("##MPass", "Password", newPass, sizeof(newPass), ImGuiInputTextFlags_Password);
-            if (ImGui::Button("Login with Email", ImVec2(panelW, 32))) {
-                if (strlen(newName) > 0 && strlen(newEmail) > 0 && strlen(newPass) > 0) {
-                    g_MailError = "Authenticating...";
-                    std::string name = newName;
-                    std::string email = newEmail;
-                    std::string pass = newPass;
+            static char mName[128] = "", mEmail[256] = "", mPass[256] = "";
+            ImGui::Dummy({0, 10});
+            ImGui::SetCursorPosX(startX); ImGui::TextDisabled("NAME");
+            ImGui::SetCursorPosX(startX); ImGui::InputText("##mn", mName, 128);
+            ImGui::SetCursorPosX(startX); ImGui::TextDisabled("EMAIL");
+            ImGui::SetCursorPosX(startX); ImGui::InputText("##me", mEmail, 256);
+            ImGui::SetCursorPosX(startX); ImGui::TextDisabled("PASSWORD");
+            ImGui::SetCursorPosX(startX); ImGui::InputText("##mp", mPass, 256, ImGuiInputTextFlags_Password);
+            ImGui::Dummy({0, 20});
+            ImGui::SetCursorPosX(startX);
+            if (ImGui::Button("Log In with Email", {panelW, 45})) {
+                if (strlen(mName) > 0 && strlen(mEmail) > 0 && strlen(mPass) > 0) {
+                    std::string name = mName, email = mEmail, pass = mPass;
                     strncpy_s(g_PendingMailName, name.c_str(), _TRUNCATE);
                     std::thread([name, email, pass]() {
                         std::string mfa_ticket;
                         std::string token = DiscordClient::LoginWithCredentials(email, pass, mfa_ticket);
                         if (!token.empty()) {
-                            Account acc = { name, token, AccountType::EMAIL };
-                            g_MailAccounts.push_back(acc);
+                            g_MailAccounts.push_back({name, token, AccountType::EMAIL});
                             SaveMailAccounts(g_MailAccounts);
-                            g_MailError = "Account added!";
+                            gc.SetToken(token); gc.Connect(); g_IsLoggedIn = true;
+                            std::thread([]() { RefreshGuilds(); RefreshPrivateChannels(); }).detach();
                         } else if (!mfa_ticket.empty()) {
-                            g_MfaTicket = mfa_ticket;
-                            g_ShowMfaModal = true;
-                            g_MailError = "";
-                        } else {
-                            g_MailError = "Login failed. Check credentials.";
+                            g_MfaTicket = mfa_ticket; g_ShowMfaModal = true;
                         }
                     }).detach();
-                    memset(newName, 0, sizeof(newName));
-                    memset(newEmail, 0, sizeof(newEmail));
-                    memset(newPass, 0, sizeof(newPass));
                 }
             }
-            if (!g_MailError.empty())
-                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "%s", g_MailError.c_str());
             ImGui::EndTabItem();
         }
-
         ImGui::EndTabBar();
     }
-    ImGui::EndChild();
     ImGui::PopItemWidth();
+    ImGui::PopClipRect();
 
     ImGui::EndGroup();
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+}
 
+void DrawMfaModal() {
     if (g_ShowMfaModal) {
         ImGui::OpenPopup("MFA Required");
     }
-    ImVec2 center = ImVec2(vp_pos.x + vp.x * 0.5f, vp_pos.y + vp.y * 0.5f);
-    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("MFA Required", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Two-Factor Authentication required.");
-        ImGui::Text("Enter your 6-digit authenticator code:");
-        ImGui::Dummy(ImVec2(0, 6));
-        ImGui::PushItemWidth(200);
-        ImGui::InputTextWithHint("##MfaCode", "000000", g_MfaCode, sizeof(g_MfaCode));
-        ImGui::PopItemWidth();
-        ImGui::Dummy(ImVec2(0, 6));
-        if (ImGui::Button("Confirm", ImVec2(95, 0))) {
-            std::string ticket = g_MfaTicket;
-            std::string code = g_MfaCode;
-            std::string name = g_PendingMailName;
-            std::thread([ticket, code, name]() {
-                std::string token = DiscordClient::SubmitMfaCode(code, ticket);
-                if (!token.empty()) {
-                    Account acc = { name, token, AccountType::EMAIL };
-                    g_MailAccounts.push_back(acc);
-                    SaveMailAccounts(g_MailAccounts);
-                    g_MailError = "Account added!";
-                } else {
-                    g_MailError = "Invalid MFA code.";
-                }
-            }).detach();
+        ImGui::Text("Enter MFA Code:");
+        static char mfaBuf[128] = "";
+        ImGui::InputText("##code", mfaBuf, sizeof(mfaBuf));
+        if (ImGui::Button("Confirm")) {
             g_ShowMfaModal = false;
-            g_MfaTicket = "";
-            memset(g_MfaCode, 0, sizeof(g_MfaCode));
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(95, 0))) {
-            g_ShowMfaModal = false;
-            g_MfaTicket = "";
-            ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
     }
-
-    ImGui::End();
 }
 
 void DrawCallView() {
@@ -1000,7 +951,7 @@ void DrawMainApp() {
     };
     if(serverBtn("__dm__","DMs","",g_SelectedGuildId.empty())) std::thread([](){RefreshPrivateChannels();}).detach();
     {ImVec2 p=ImGui::GetCursorScreenPos();rDL->AddRectFilled({p.x+14,p.y+4},{p.x+RAIL_W-14,p.y+6},IM_COL32(80,80,85,255),1.f);ImGui::Dummy({0,14});}
-    {std::lock_guard<std::mutex> lk(g_DataMutex);for(auto&g:g_Guilds)if(serverBtn(g.id,g.name,g.icon_hash,g.id==g_SelectedGuildId))std::thread([g](){RefreshChannels(g.id);}).detach();}
+    {std::lock_guard<std::mutex> lk(g_DataMutex);for(auto&g:g_Guilds)if(serverBtn(g.id,g.name,g.icon_hash,g.id==g_SelectedGuildId))std::thread([g](){RefreshChannels(g.id); gc.SubscribeToGuild(g.id);}).detach();}
     ImGui::EndChild();ImGui::PopStyleVar();ImGui::PopStyleColor();ImGui::SameLine(0,0);
 
     // ── CHANNEL LIST ─────────────────────────────────────────────

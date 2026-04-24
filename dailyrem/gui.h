@@ -1,5 +1,5 @@
 #pragma once
 #include <string>
 
-// Run the GUI application.
+//  Run the GUI application.
 int RunGUI();

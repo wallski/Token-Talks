@@ -3,6 +3,6 @@ using System.IO;
 
 class Program {
     static void Main() {
-        Console.WriteLine("Testing compile for VoiceLoop debug...");
+        File.AppendAllText("test.log", "test");
     }
 }

@@ -137,6 +137,7 @@ public:
     std::vector<VoiceMember> GetVoiceMembers(const std::string& channel_id = "");
     void SetVoiceState(bool muted, bool deafened);
     void SetAudioDevices(int inputIdx, int outputIdx);
+    void SubscribeToGuild(const std::string& guildId);
 
     // Public state (read by GUI)
     VoiceConnection          m_VoiceConn;
@@ -150,6 +151,7 @@ private:
     std::string         m_DisplayName;
     std::string         m_AvatarHash;
     std::string         m_SessionId;
+    std::string         m_VoiceSessionId;
     int                 m_HeartbeatInterval = 41250;
     int                 m_SequenceNumber    = 0;
 
