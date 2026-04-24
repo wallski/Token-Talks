@@ -35,6 +35,8 @@ public:
     std::string GetToken() const;
     std::string GetUserId() const;
     static bool ValidateToken(const std::string& token);
+    static std::string LoginWithCredentials(const std::string& email, const std::string& password, std::string& out_mfa_ticket);
+    static std::string SubmitMfaCode(const std::string& code, const std::string& ticket);
 
     bool Connect();
     void Disconnect();

@@ -2,15 +2,16 @@
 #include <string>
 #include <vector>
 
+enum class AccountType { TOKEN, EMAIL };
+
 struct Account {
     std::string name;
     std::string token;
+    AccountType type = AccountType::TOKEN;
 };
 
-// disk IO
-void LoadAccounts(std::vector<Account>& list);
-void SaveAccounts(const std::vector<Account>& list);
+void LoadTokenAccounts(std::vector<Account>& list);
+void SaveTokenAccounts(const std::vector<Account>& list);
 
-// menus
-void AccountManagerLoop();
-bool PickAccount(Account& out);
+void LoadMailAccounts(std::vector<Account>& list);
+void SaveMailAccounts(const std::vector<Account>& list);

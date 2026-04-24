@@ -35,6 +35,36 @@ bool DiscordClient::ValidateToken(const std::string &token) {
   return false;
 }
 
+std::string DiscordClient::LoginWithCredentials(const std::string& email, const std::string& password, std::string& out_mfa_ticket) {
+  DiscordClient temp;
+  json payload = { {"login", email}, {"password", password}, {"undelete", false}, {"captcha_key", nullptr}, {"login_source", nullptr}, {"gift_code_sku_id", nullptr} };
+  std::string resp = temp.HttpRequest("POST", "/api/v9/auth/login", payload.dump());
+  if (resp.empty()) return "";
+  try {
+    auto j = json::parse(resp);
+    if (j.contains("token") && !j["token"].is_null())
+      return j["token"].get<std::string>();
+    if (j.contains("mfa") && j["mfa"].get<bool>() && j.contains("ticket")) {
+      out_mfa_ticket = j["ticket"].get<std::string>();
+      return "";
+    }
+  } catch (...) {}
+  return "";
+}
+
+std::string DiscordClient::SubmitMfaCode(const std::string& code, const std::string& ticket) {
+  DiscordClient temp;
+  json payload = { {"code", code}, {"ticket", ticket} };
+  std::string resp = temp.HttpRequest("POST", "/api/v9/auth/mfa/totp", payload.dump());
+  if (resp.empty()) return "";
+  try {
+    auto j = json::parse(resp);
+    if (j.contains("token") && !j["token"].is_null())
+      return j["token"].get<std::string>();
+  } catch (...) {}
+  return "";
+}
+
 bool DiscordClient::Connect() {
   if (m_Token.empty())
     return false;

@@ -6,7 +6,8 @@
 #include <limits>
 #include <algorithm>
 
-static const char* FILE_NAME = "accounts.dat";
+static const char* TOKEN_FILE = "tokenAccounts.dat";
+static const char* MAIL_FILE  = "mailAccounts.dat";
 static const unsigned char XOR_KEY[] = { 0x54, 0x4B, 0x56, 0x61, 0x75, 0x6C, 0x74, 0x21 };
 
 static std::string XorCipher(const std::string& in) {
@@ -42,103 +43,29 @@ static std::string FromHex(const std::string& in) {
     return out;
 }
 
-void LoadAccounts(std::vector<Account>& list) {
+static void LoadFromFile(const char* filename, AccountType type, std::vector<Account>& list) {
     list.clear();
-    std::ifstream f(FILE_NAME);
+    std::ifstream f(filename);
     if (!f) return;
     Account a;
     std::string enc_token;
+    a.type = type;
     while (std::getline(f, a.name) && std::getline(f, enc_token)) {
         if (!a.name.empty() && a.name.back() == '\r') a.name.pop_back();
         if (!enc_token.empty() && enc_token.back() == '\r') enc_token.pop_back();
         a.token = XorCipher(FromHex(enc_token));
         list.push_back(a);
+        a.type = type;
     }
 }
 
-void SaveAccounts(const std::vector<Account>& list) {
-    std::ofstream f(FILE_NAME);
+static void SaveToFile(const char* filename, const std::vector<Account>& list) {
+    std::ofstream f(filename);
     for (const auto& a : list)
         f << a.name << '\n' << ToHex(XorCipher(a.token)) << '\n';
 }
 
-static void AddTokenAccount(std::vector<Account>& list) {
-    clearScreen();
-    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    Account a;
-    std::cout << "Give this account a name: ";
-    std::getline(std::cin, a.name);
-    std::cout << "Paste the token (Bot or user): ";
-    std::getline(std::cin, a.token);
-    list.push_back(a);
-    SaveAccounts(list);
-    std::cout << "Account added.\n";
-    pauseAndClear();
-}
-
-static void ShowPickList(const std::vector<Account>& list, int& choice) {
-    clearScreen();
-    std::cout << "----- pick account -----\n";
-    for (size_t i = 0; i < list.size(); ++i)
-        std::cout << i + 1 << ") " << list[i].name << '\n';
-    std::cout << list.size() + 1 << ") back\n\nchoice: ";
-    std::cin >> choice;
-}
-
-bool PickAccount(Account& out) {
-    std::vector<Account> list;
-    LoadAccounts(list);
-    if (list.empty()) {
-        std::cout << "No accounts saved yet.\n";
-        pauseAndClear();
-        return false;
-    }
-    int c;
-    ShowPickList(list, c);
-    if (c < 1 || c > static_cast<int>(list.size())) return false;
-    out = list[c - 1];
-    return true;
-}
-
-static void RemoveAccount(std::vector<Account>& list) {
-    clearScreen();
-    if (list.empty()) {
-        std::cout << "No accounts to remove.\n";
-        pauseAndClear();
-        return;
-    }
-    for (size_t i = 0; i < list.size(); ++i)
-        std::cout << i + 1 << ") " << list[i].name << '\n';
-    std::cout << list.size() + 1 << ") back\n\nchoice: ";
-    int c;  std::cin >> c;
-    if (c >= 1 && c <= static_cast<int>(list.size())) {
-        list.erase(list.begin() + (c - 1));
-        SaveAccounts(list);
-        std::cout << "Account removed.\n";
-    }
-    pauseAndClear();
-}
-
-void AccountManagerLoop() {
-    std::vector<Account> list;
-    LoadAccounts(list);
-    while (true) {
-        clearScreen();
-        std::cout << "----- account manager -----\n"
-            << "1) add account\n"
-            << "2) remove account\n"
-            << "3) back\n\nchoice: ";
-        int choice;
-        std::cin >> choice;
-        if (choice == 3) break;
-        if (choice == 1) {
-            clearScreen();
-            std::cout << "1) add token account\n"
-                << "2) back\n\nchoice: ";
-            int sub;
-            std::cin >> sub;
-            if (sub == 1) AddTokenAccount(list);
-        }
-        if (choice == 2) RemoveAccount(list);
-    }
-}
+void LoadTokenAccounts(std::vector<Account>& list) { LoadFromFile(TOKEN_FILE, AccountType::TOKEN, list); }
+void SaveTokenAccounts(const std::vector<Account>& list) { SaveToFile(TOKEN_FILE, list); }
+void LoadMailAccounts(std::vector<Account>& list) { LoadFromFile(MAIL_FILE, AccountType::EMAIL, list); }
+void SaveMailAccounts(const std::vector<Account>& list) { SaveToFile(MAIL_FILE, list); }
