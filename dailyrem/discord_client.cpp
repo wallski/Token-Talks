@@ -830,70 +830,135 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                 uint8_t op = uint8_t(wsMessage[2]);
                 const uint8_t* payload = (const uint8_t*)wsMessage.data() + 3;
                 size_t payloadLen = wsMessage.size() - 3;
-                DebugLog("[VOICE BIN RX] Op: " + std::to_string(op) + " Seq: " + std::to_string(seq));
-                if (op == 24) {
-                    if (payloadLen < 1) continue;
-                    uint8_t epoch = payload[0];
-                    DebugLog("[VOICE] DAVE Prepare Epoch: " + std::to_string(epoch));
-                }
-                else if (op == 25) {
-                    DebugLog("[VOICE] DAVE MLS External Sender received, length=" + std::to_string(payloadLen));
-                    if (m_VoiceConn.m_DaveSession)
-                        daveSessionSetExternalSender((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload, payloadLen);
-                }
-                else if (op == 26) {
-                    DebugLog("[VOICE] MLS Key Package received (Op 26), len=" + std::to_string(payloadLen));
-                }
-                else if (op == 27) {
-                    DebugLog("[VOICE] MLS Proposals received (Op 27), len=" + std::to_string(payloadLen));
-                    if (m_VoiceConn.m_DaveSession && payloadLen > 0) {
-                        std::vector<const char*> userPtrs;
-                        for (const auto& uid : m_VoiceConn.m_RecognizedUserIds) userPtrs.push_back(uid.c_str());
-                        uint8_t* cw = nullptr;
-                        size_t cwLen = 0;
-                        daveSessionProcessProposals((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload, payloadLen,
-                            userPtrs.data(), userPtrs.size(), &cw, &cwLen);
-                        if (cw && cwLen > 0) {
-                            DebugLog("[VOICE] Generated Commit+Welcome, sending Op 28, bytes=" + std::to_string(cwLen));
-                            std::vector<uint8_t> msg = { 0, 0, 28 };
-                            msg.insert(msg.end(), cw, cw + cwLen);
-                            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, msg.data(), (DWORD)msg.size());
-                            daveFree(cw);
-                        }
-                    }
-                }
-                else if (op == 29) {
-                    if (payloadLen < 2) continue;
-                    uint16_t transition_id = (uint16_t(payload[0]) << 8) | payload[1];
-                    const uint8_t* actualPayload = payload + 2;
-                    size_t actualLen = payloadLen - 2;
-                    DebugLog("[VOICE] MLS Commit received (Op 29) for ID: " + std::to_string(transition_id));
+                
+                DebugLog("[VOICE BIN RX] Op: " + std::to_string(op) + " Seq: " + std::to_string(seq) + " Len: " + std::to_string(payloadLen));
+                
+                // Op 25: External Sender
+                if (op == 25 && payloadLen < 100) {
+                    DebugLog("[VOICE] DAVE External Sender");
                     if (m_VoiceConn.m_DaveSession) {
-                        void* result = daveSessionProcessCommit((DAVESessionHandle)m_VoiceConn.m_DaveSession, actualPayload, actualLen);
-                        if (result) {
-                            json ready = { {"op", 23}, {"d", {{"transition_id", (int)transition_id}}} };
-                            std::string sReady = ready.dump();
-                            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sReady.c_str(), (DWORD)sReady.size());
-                            daveCommitResultDestroy((DAVECommitResultHandle)result);
-                        }
+                        daveSessionSetExternalSender(
+                            (DAVESessionHandle)m_VoiceConn.m_DaveSession, 
+                            payload, payloadLen
+                        );
+                        
+                        // Subscribe to join the group
+                        json sub = {{"op", 16}, {"d", {
+                            {"audio_ssrc", m_VoiceConn.m_Ssrc},
+                            {"video_ssrc", 0}, {"rtx_ssrc", 0}
+                        }}};
+                        std::string s = sub.dump();
+                        WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
+                            WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                            (void*)s.c_str(), (DWORD)s.size());
+                        DebugLog("[VOICE] Sent Subscribe (Op 16)");
                     }
                 }
+                
+                // Op 30: MLS Welcome (joining existing call)
                 else if (op == 30) {
-                    DebugLog("[VOICE] MLS Welcome received (Op 30), length=" + std::to_string(payloadLen));
-                    if (m_VoiceConn.m_DaveSession) {
-                        std::vector<const char*> userPtrs;
-                        for (const auto& uid : m_VoiceConn.m_RecognizedUserIds) userPtrs.push_back(uid.c_str());
-                        void* result = daveSessionProcessWelcome((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload, payloadLen,
-                            userPtrs.data(), userPtrs.size());
+                    DebugLog("[VOICE] MLS Welcome (Op 30), len=" + std::to_string(payloadLen));
+                    
+                    if (m_VoiceConn.m_DaveSession && payloadLen > 0) {
+                        std::vector<const char*> users;
+                        for (auto& u : m_VoiceConn.m_RecognizedUserIds) 
+                            users.push_back(u.c_str());
+                        
+                        void* result = daveSessionProcessWelcome(
+                            (DAVESessionHandle)m_VoiceConn.m_DaveSession,
+                            payload, payloadLen, users.data(), users.size()
+                        );
+                        
                         if (result) {
-                            uint16_t transition_id = 1;
-                            json ready = { {"op", 23}, {"d", {{"transition_id", (int)transition_id}}} };
-                            std::string sReady = ready.dump();
-                            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sReady.c_str(), (DWORD)sReady.size());
+                            DebugLog("[VOICE] Welcome processed! Sending Op 23");
+                            
+                            // Send Transition Ready
+                            uint8_t ready[4] = {0, 0, 23, 1};
+                            WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
+                                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                                ready, 4);
+                            
+                            // Set encryption keys
+                            if (m_VoiceConn.m_DaveEncryptor) {
+                                void* kr = daveSessionGetKeyRatchet(
+                                    (DAVESessionHandle)m_VoiceConn.m_DaveSession,
+                                    userId.c_str()
+                                );
+                                if (kr) {
+                                    daveEncryptorSetKeyRatchet(
+                                        (DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor,
+                                        (DAVEKeyRatchetHandle)kr
+                                    );
+                                    daveKeyRatchetDestroy((DAVEKeyRatchetHandle)kr);
+                                    DebugLog("[VOICE] Encryption keys set!");
+                                }
+                            }
                             daveWelcomeResultDestroy((DAVEWelcomeResultHandle)result);
                         }
                     }
                 }
+                
+                // Op 27: Proposals (when YOU are coordinator)
+                else if (op == 27) {
+                    DebugLog("[VOICE] Proposals (Op 27), len=" + std::to_string(payloadLen));
+                    
+                    if (m_VoiceConn.m_DaveSession && payloadLen > 0) {
+                        std::vector<const char*> users;
+                        for (auto& u : m_VoiceConn.m_RecognizedUserIds)
+                            users.push_back(u.c_str());
+                        
+                        uint8_t* cw = nullptr;
+                        size_t cwLen = 0;
+                        daveSessionProcessProposals(
+                            (DAVESessionHandle)m_VoiceConn.m_DaveSession,
+                            payload, payloadLen, users.data(), users.size(),
+                            &cw, &cwLen
+                        );
+                        
+                        if (cw && cwLen > 0) {
+                            std::vector<uint8_t> msg = {0, 0, 28};
+                            msg.insert(msg.end(), cw, cw + cwLen);
+                            WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
+                                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                                msg.data(), (DWORD)msg.size());
+                            DebugLog("[VOICE] Sent Commit/Welcome (Op 28)");
+                            daveFree(cw);
+                        }
+                    }
+                }
+                
+                // Op 29: Commit
+                else if (op == 29 && payloadLen >= 2) {
+                    uint16_t tid = (payload[0] << 8) | payload[1];
+                    DebugLog("[VOICE] Commit (Op 29) transition=" + std::to_string(tid));
+                    
+                    if (m_VoiceConn.m_DaveSession) {
+                        void* result = daveSessionProcessCommit(
+                            (DAVESessionHandle)m_VoiceConn.m_DaveSession,
+                            payload + 2, payloadLen - 2
+                        );
+                        if (result) {
+                            uint8_t ready[4] = {0, 0, 23, (uint8_t)tid};
+                            WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
+                                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                                ready, 4);
+                            DebugLog("[VOICE] Sent Op 23 for transition " + std::to_string(tid));
+                            daveCommitResultDestroy((DAVECommitResultHandle)result);
+                        }
+                    }
+                }
+                
+                // Op 22: Execute Transition
+                else if (op == 22) {
+                    DebugLog("[VOICE] 🎉 EXECUTE TRANSITION - DAVE READY!");
+                    m_VoiceConn.m_DaveHandshakeComplete = true;
+                    m_VoiceConn.m_Ready = true;
+                    m_VoiceReady = true;
+                    
+                    // Start audio thread
+                    std::thread(&DiscordClient::AudioCaptureLoop, this).detach();
+                }
+                
                 continue;
             }
             DebugLog("[VOICE RX RAW] " + wsMessage);
@@ -1027,11 +1092,14 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                     }).detach();
             }
             else if (op == 11) {
-                if (j["d"].contains("user_id")) {
-                    std::string uid = j["d"]["user_id"].get<std::string>();
-                    if (std::find(m_VoiceConn.m_RecognizedUserIds.begin(), m_VoiceConn.m_RecognizedUserIds.end(), uid) == m_VoiceConn.m_RecognizedUserIds.end())
-                        m_VoiceConn.m_RecognizedUserIds.push_back(uid);
-                    DebugLog("[VOICE] Client Connect: " + uid);
+                if (j["d"].contains("user_ids")) {
+                    for (const auto& uid : j["d"]["user_ids"]) {
+                        std::string user_id = uid.get<std::string>();
+                        if (std::find(m_VoiceConn.m_RecognizedUserIds.begin(), m_VoiceConn.m_RecognizedUserIds.end(), user_id) == m_VoiceConn.m_RecognizedUserIds.end()) {
+                            m_VoiceConn.m_RecognizedUserIds.push_back(user_id);
+                        }
+                    }
+                    DebugLog("[VOICE] Recognized users count: " + std::to_string(m_VoiceConn.m_RecognizedUserIds.size()));
                 }
             }
             else if (op == 13) {
@@ -1042,21 +1110,7 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                     DebugLog("[VOICE] Client Disconnect: " + uid);
                 }
             }
-            else if (op == 22) {
-                DebugLog("[VOICE] Execute Transition received - DAVE HANDSHAKE COMPLETE!");
-                m_VoiceConn.m_DaveHandshakeComplete = true;
-                m_VoiceConn.m_Ready = true;
-                m_VoiceReady = true;
-                if (m_VoiceConn.m_DaveEncryptor && m_VoiceConn.m_DaveSession) {
-                    void* kr = daveSessionGetKeyRatchet((DAVESessionHandle)m_VoiceConn.m_DaveSession, m_UserId.c_str());
-                    if (kr) {
-                        daveEncryptorSetKeyRatchet((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor, (DAVEKeyRatchetHandle)kr);
-                        daveKeyRatchetDestroy((DAVEKeyRatchetHandle)kr);
-                        DebugLog("[VOICE] Key ratchet set for encryption");
-                    }
-                }
-                std::thread(&DiscordClient::AudioCaptureLoop, this).detach();
-            }
+            
         }
         catch (...) {}
     }
