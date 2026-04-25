@@ -1144,11 +1144,14 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
           }
         } else if (op == 25) { // DAVE_PREPARE_TRANSITION
           if (payloadLen < 1) continue;
-          uint8_t epoch = payload[0];
-          DebugLog("[VOICE] DAVE Prepare Transition: " + std::to_string(epoch));
-          // Send Transition Ready (Op 23)
-          unsigned char resp[4] = {0, 0, 23, epoch}; // seq, op 23, epoch
-          WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, resp, 4);
+          uint8_t transition_id = payload[0];
+          DebugLog("[VOICE] DAVE Prepare Transition: " + std::to_string(transition_id));
+          
+          // Send Transition Ready (Op 23) as JSON
+          json ready = {{"op", 23}, {"d", {{"transition_id", (int)transition_id}}}};
+          std::string sReady = ready.dump();
+          WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sReady.c_str(), (DWORD)sReady.size());
+          DebugLog("[VOICE] Sent DAVE_TRANSITION_READY (Op 23) for ID: " + std::to_string(transition_id));
         } else if (op == 28) { // MLS_COMMIT
           if (m_VoiceConn.m_DaveSession) {
               void* result = daveSessionProcessCommit((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload, payloadLen);
