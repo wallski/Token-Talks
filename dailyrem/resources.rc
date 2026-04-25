@@ -1,0 +1,10 @@
+// Resource script for Token-Talks
+// Embeds all required DLLs for a single-file EXE experience
+
+101 RCDATA "vendor\\dlls\\dpp.dll"
+102 RCDATA "vendor\\dlls\\libcrypto-1_1-x64.dll"
+103 RCDATA "vendor\\dlls\\libdave.dll"
+104 RCDATA "vendor\\dlls\\libsodium.dll"
+105 RCDATA "vendor\\dlls\\libssl-1_1-x64.dll"
+106 RCDATA "vendor\\dlls\\opus.dll"
+107 RCDATA "vendor\\dlls\\zlib1.dll"
