@@ -20,9 +20,11 @@
 using json = nlohmann::json;
 
 #include <fstream>
-static void DebugLog(const std::string& text) {
-    std::ofstream f("discord_debug.log", std::ios::app);
-    f << text << "\n";
+void DebugLog(const std::string &text) {
+  std::ofstream f("discord_debug.log", std::ios::app);
+  f << text << "\n";
+  std::cout << text
+            << std::endl; // Also print to terminal for real-time debugging
 }
 
 DiscordClient::DiscordClient()
@@ -44,7 +46,17 @@ void DiscordClient::SetToken(const std::string &token) { m_Token = token; }
 
 std::string DiscordClient::GetToken() const { return m_Token; }
 
-std::string DiscordClient::GetUserId() const { return m_UserId; }
+std::string DiscordClient::GetSessionId() const {
+  std::lock_guard<std::mutex> lock(
+      const_cast<DiscordClient *>(this)->m_IdMutex);
+  return m_SessionId;
+}
+
+std::string DiscordClient::GetUserId() const {
+  std::lock_guard<std::mutex> lock(
+      const_cast<DiscordClient *>(this)->m_IdMutex);
+  return m_UserId;
+}
 std::string DiscordClient::GetUserName() const { return m_DisplayName; }
 std::string DiscordClient::GetUserAvatar() const { return m_AvatarHash; }
 
@@ -159,6 +171,10 @@ void DiscordClient::SetOnMessageCallback(
 
 void DiscordClient::SetOnConnectedCallback(std::function<void()> cb) {
   m_ConnectedCallback = cb;
+}
+
+void DiscordClient::SetOnCallCallback(std::function<void(const std::string&, const std::string&)> cb) {
+  m_CallCallback = cb;
 }
 
 bool DiscordClient::IsConnected() const { return m_Connected; }
@@ -610,23 +626,21 @@ void DiscordClient::ParseJsonMessage(const json &item, DiscordMessage &dmsg) {
   }
 }
 
-void DiscordClient::SubscribeToGuild(const std::string& guildId) {
-    if (guildId.empty()) return;
-    DebugLog("[GATEWAY] Subscribing to guild: " + guildId);
-    
-    // We'll also try to fetch members in the subscription to get voice states
-    json sub = {
-        {"op", 14},
-        {"d", {
-            {"guild_id", guildId},
-            {"typing", true},
-            {"threads", true},
-            {"activities", true},
-            {"members", json::array()},
-            {"channels", json::object()}
-        }}
-    };
-    QueueWsMessage(sub.dump());
+void DiscordClient::SubscribeToGuild(const std::string &guildId) {
+  if (guildId.empty())
+    return;
+  DebugLog("[GATEWAY] Subscribing to guild: " + guildId);
+
+  // We'll also try to fetch members in the subscription to get voice states
+  json sub = {{"op", 14},
+              {"d",
+               {{"guild_id", guildId},
+                {"typing", true},
+                {"threads", true},
+                {"activities", true},
+                {"members", json::array()},
+                {"channels", json::object()}}}};
+  QueueWsMessage(sub.dump());
 }
 
 void DiscordClient::SendIdentify(void *hWebSocket) {
@@ -635,21 +649,45 @@ void DiscordClient::SendIdentify(void *hWebSocket) {
       {"d",
        {{"token", m_Token},
         {"properties",
-         {{"$os", "Windows"}, {"$browser", "Chrome"}, {"$device", "PC"}}}}}};
+         {{"os", "Windows"},
+          {"browser", "Chrome"},
+          {"device", ""},
+          {"system_locale", "en-US"},
+          {"browser_user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+          {"browser_version", "120.0.0.0"},
+          {"os_version", "10"},
+          {"referrer", ""},
+          {"referring_domain", ""},
+          {"referrer_current", ""},
+          {"referring_domain_current", ""},
+          {"release_channel", "stable"},
+          {"client_build_number", 284698},
+          {"client_event_source", nullptr}}},
+        {"compress", false},
+        {"client_state",
+         {{"capabilities", 16383},
+          {"highest_last_message_id", "0"},
+          {"read_state_version", 0},
+          {"user_guild_settings_version", -1},
+          {"user_settings_version", -1}}}}}};
   QueueWsMessage(identify.dump());
 }
 
 void DiscordClient::WebSocketLoop() {
   HINTERNET hSession =
-      WinHttpOpen(L"msgEZ/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+      WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", 
+                  WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   HINTERNET hConnect = WinHttpConnect(hSession, L"gateway.discord.gg",
                                       INTERNET_DEFAULT_HTTPS_PORT, 0);
   HINTERNET hRequest = WinHttpOpenRequest(
-      hConnect, L"GET", L"/?v=9&encoding=json", NULL, WINHTTP_NO_REFERER,
+      hConnect, L"GET", L"/?v=10&encoding=json", NULL, WINHTTP_NO_REFERER,
       WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
   WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
-  WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+  LPCWSTR headers = L"Origin: https://discord.com\r\n"
+                    L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+                    L"Accept-Language: en-US,en;q=0.9\r\n";
+  WinHttpSendRequest(hRequest, headers, (DWORD)-1L,
                      WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
   WinHttpReceiveResponse(hRequest, NULL);
 
@@ -671,7 +709,7 @@ void DiscordClient::WebSocketLoop() {
   // Allocate buffer
   const DWORD cbBuffer = 65536;
   BYTE *pbBuffer = new BYTE[cbBuffer];
-
+  std::string accumulator;
   while (m_Connected) {
     DWORD cbDataRead = 0;
     WINHTTP_WEB_SOCKET_BUFFER_TYPE eBufferType;
@@ -683,8 +721,14 @@ void DiscordClient::WebSocketLoop() {
     if (eBufferType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE)
       break;
 
-    if (cbDataRead > 0) {
-      std::string msg((char *)pbBuffer, cbDataRead);
+    accumulator.append((char *)pbBuffer, cbDataRead);
+
+    if (eBufferType == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE ||
+        eBufferType == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
+
+      std::string msg = accumulator;
+      accumulator.clear();
+
       try {
         auto j = json::parse(msg);
         int op = j["op"].get<int>();
@@ -701,12 +745,34 @@ void DiscordClient::WebSocketLoop() {
         } else if (op == 0) { // Dispatch
           std::string t = j["t"].get<std::string>();
           if (t == "READY") {
-            // Capture our session_id — required for voice Identify (Op 0)
-            if (j["d"].contains("session_id") &&
-                !j["d"]["session_id"].is_null())
-              m_SessionId = j["d"]["session_id"].get<std::string>();
+            DebugLog(
+                "[GATEWAY] Received READY event (Assembled). Deep-scanning...");
+            std::lock_guard<std::mutex> lock(m_IdMutex);
+            if (j.contains("d")) {
+              const auto &d = j["d"];
+              if (d.contains("session_id"))
+                m_SessionId = d["session_id"].get<std::string>();
+              if (m_SessionId.empty() && d.contains("sessions") &&
+                  d["sessions"].is_array() && !d["sessions"].empty()) {
+                if (d["sessions"][0].contains("session_id"))
+                  m_SessionId =
+                      d["sessions"][0]["session_id"].get<std::string>();
+              }
+              if (d.contains("user") && d["user"].contains("id"))
+                m_UserId = d["user"]["id"].get<std::string>();
+            }
+            if (!m_SessionId.empty())
+              DebugLog("[GATEWAY] SUCCESS: Captured Primary Session ID: " +
+                       m_SessionId);
+            else
+              DebugLog("[GATEWAY] ERROR: No session ID found in assembled "
+                       "READY payload.");
             if (m_ConnectedCallback)
               m_ConnectedCallback();
+
+            // Send presence update after READY to match browser behavior
+            json presence = {{"op", 3}, {"d", {{"status", "online"}, {"since", 0}, {"activities", json::array()}, {"afk", false}}}};
+            QueueWsMessage(presence.dump());
           } else if (t == "MESSAGE_CREATE") {
             if (m_MessageCallback) {
               DiscordMessage dmsg;
@@ -714,53 +780,89 @@ void DiscordClient::WebSocketLoop() {
               m_MessageCallback(dmsg);
             }
           } else if (t == "GUILD_CREATE") {
-            DebugLog("[GATEWAY] GUILD_CREATE parsing");
             if (j["d"].contains("voice_states") &&
                 j["d"]["voice_states"].is_array()) {
-              DebugLog("[GATEWAY] Found voice_states. Count: " + std::to_string(j["d"]["voice_states"].size()));
               for (const auto &vs : j["d"]["voice_states"]) {
                 ParseVoiceStateUpdate(vs);
               }
-            } else {
-              DebugLog("[GATEWAY] GUILD_CREATE missing voice_states array.");
             }
           } else if (t == "VOICE_STATE_UPDATE") {
-            if (j["d"].contains("user_id") && j["d"]["user_id"].is_string() && j["d"]["user_id"].get<std::string>() == m_UserId) {
+            if (j["d"].contains("user_id") && j["d"]["user_id"].is_string() && 
+                j["d"]["user_id"].get<std::string>() == m_UserId) {
+                
                 if (j["d"].contains("session_id") && !j["d"]["session_id"].is_null()) {
                     m_VoiceSessionId = j["d"]["session_id"].get<std::string>();
-                    DebugLog("[GATEWAY] Captured Voice Session ID: " + m_VoiceSessionId);
+                    DebugLog("[GATEWAY] Captured OUR Voice Session ID: " + m_VoiceSessionId);
                 }
             }
             ParseVoiceStateUpdate(j["d"]);
-          } else if (t == "VOICE_SERVER_UPDATE") {
-            auto d = j["d"];
-            if (d["endpoint"].is_null())
-              continue; // Server is currently unavailable
-
-            m_VoiceConn.m_Endpoint = d["endpoint"].get<std::string>();
-            m_VoiceConn.m_Token = d["token"].get<std::string>();
-            m_VoiceConn.m_GuildId = d["guild_id"].get<std::string>();
-
-            // CRITICAL: Stop any existing voice loop before starting a new one
-            if (m_VoiceConn.m_Running) {
-                m_VoiceConn.m_Running = false;
-                if (m_VoiceConn.m_hVoiceWS) {
-                    WinHttpWebSocketClose(m_VoiceConn.m_hVoiceWS, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
-                    m_VoiceConn.m_hVoiceWS = nullptr;
-                }
-                if (m_VoiceConn.m_VoiceThread.joinable()) {
-                    m_VoiceConn.m_VoiceThread.detach();
+            
+            // Trigger voice loop if we already have the server info
+            {
+                std::lock_guard<std::mutex> lock(m_WsMutex); // Using existing WsMutex for simplicity
+                if (!m_VoiceConn.m_Token.empty() &&
+                    !m_VoiceConn.m_Endpoint.empty() && !m_VoiceSessionId.empty() &&
+                    !m_VoiceConn.m_Running) {
+                  m_VoiceConn.m_Running = true;
+                  if (m_VoiceConn.m_VoiceThread.joinable()) m_VoiceConn.m_VoiceThread.detach();
+                  
+                  m_VoiceConn.m_VoiceThread = std::thread(
+                      &DiscordClient::VoiceLoop, this, m_VoiceConn.m_Endpoint,
+                      m_VoiceConn.m_Token, m_VoiceConn.m_GuildId, m_VoiceSessionId,
+                      m_UserId);
                 }
             }
+          } else if (t == "VOICE_SERVER_UPDATE") {
+            if (j["d"].contains("endpoint") && !j["d"]["endpoint"].is_null()) {
+              m_VoiceConn.m_Endpoint = j["d"]["endpoint"].get<std::string>();
+              m_VoiceConn.m_Token = j["d"]["token"].get<std::string>();
+              m_VoiceConn.m_GuildId = (j["d"].contains("guild_id") && !j["d"]["guild_id"].is_null()) ? j["d"]["guild_id"].get<std::string>() : "";
+              DebugLog("[GATEWAY] VOICE_SERVER_UPDATE: Token=" + m_VoiceConn.m_Token);
 
-            m_VoiceConn.m_Running = true;
-            m_VoiceConn.m_VoiceThread =
-                std::thread(&DiscordClient::VoiceLoop, this,
-                            m_VoiceConn.m_Endpoint, m_VoiceConn.m_Token,
-                            m_VoiceConn.m_GuildId, m_VoiceSessionId, m_UserId);
+              // Only start if we also have the session ID
+              {
+                  std::lock_guard<std::mutex> lock(m_WsMutex);
+                  if (!m_VoiceSessionId.empty() && !m_VoiceConn.m_Running) {
+                    m_VoiceConn.m_Running = true;
+                    if (m_VoiceConn.m_VoiceThread.joinable()) m_VoiceConn.m_VoiceThread.detach();
+                    
+                    m_VoiceConn.m_VoiceThread = std::thread(
+                        &DiscordClient::VoiceLoop, this, m_VoiceConn.m_Endpoint,
+                        m_VoiceConn.m_Token, m_VoiceConn.m_GuildId, m_VoiceSessionId,
+                        m_UserId);
+                  }
+              }
+            }
+          } else if (t == "CALL_CREATE" || t == "CALL_UPDATE") {
+            DebugLog("[GATEWAY] CALL EVENT (" + t + "): " + j["d"].dump());
+            if (m_CallCallback && j["d"].contains("channel_id")) {
+                std::string cid = j["d"]["channel_id"].get<std::string>();
+                
+                bool weAreCalling = false;
+                if (j["d"].contains("ongoing_rings") && j["d"].contains("ongoing_rings") && j["d"]["ongoing_rings"].is_object()) {
+                    for (auto& it : j["d"]["ongoing_rings"].items()) {
+                        if (it.value().is_string() && it.value().get<std::string>() == m_UserId) {
+                            weAreCalling = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if (weAreCalling) {
+                    DebugLog("[GATEWAY] We are the caller. Ignoring overlay.");
+                } else {
+                    m_CallCallback(cid, "Incoming Call...");
+                }
+            }
+          } else if (t == "CALL_DELETE") {
+             DebugLog("[GATEWAY] CALL TERMINATED. Clearing overlay.");
+             if (m_CallCallback) {
+                 m_CallCallback("", "STOP"); // Special signal to clear
+             }
           }
         }
-      } catch (...) {
+      } catch (const std::exception &e) {
+        DebugLog("[GATEWAY] Parse Error: " + std::string(e.what()));
       }
     }
   }
@@ -784,22 +886,50 @@ void DiscordClient::WebSocketLoop() {
 
 bool DiscordClient::JoinVoiceChannel(const std::string &guild_id,
                                      const std::string &channel_id) {
+  DebugLog("[VOICE-JOIN] Entering JoinVoiceChannel...");
+  std::lock_guard<std::mutex> lock(m_WsMutex);
+  DebugLog("[VOICE-JOIN] Mutex locked. Resetting state...");
   m_VoiceReady = false;
-  json payload = {
-      {"op", 4},
-      {"d",
-       {{"guild_id", guild_id},
-        {"channel_id", (channel_id.empty() ? nullptr : json(channel_id))},
-        {"self_mute", false},
-        {"self_deaf", false}}}};
-  QueueWsMessage(payload.dump());
+  m_VoiceSessionId.clear();
+  m_VoiceConn.m_Running = false;
+  m_VoiceConn.m_GuildId = guild_id;
+  m_VoiceConn.m_ChannelId = channel_id;
+  m_VoiceConn.m_Token.clear();
+  m_VoiceConn.m_Endpoint.clear();
+
+  DebugLog("[VOICE-JOIN] Preparing JSON...");
+  json d;
+  if (guild_id.empty()) d["guild_id"] = nullptr;
+  else d["guild_id"] = guild_id;
+  
+  d["channel_id"] = channel_id;
+  d["self_mute"] = false;
+  d["self_deaf"] = false;
+  d["self_video"] = false;
+
+  json j;
+  j["op"] = 4;
+  j["d"] = d;
+  
+  DebugLog("[VOICE-JOIN] Sending Op 4...");
+  QueueWsMessage(j.dump());
+  DebugLog("[VOICE-JOIN] Exit.");
   return true;
 }
 
 void DiscordClient::LeaveVoiceChannel(const std::string &guild_id) {
   JoinVoiceChannel(guild_id, ""); // Sending null channel ID leaves the channel
+  
+  // Hard kill the voice WS to force the loop to finish
+  {
+    std::lock_guard<std::mutex> lock(m_WsMutex);
+    if (m_VoiceConn.m_hVoiceWS) {
+        WinHttpWebSocketClose((HINTERNET)m_VoiceConn.m_hVoiceWS, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+        WinHttpCloseHandle((HINTERNET)m_VoiceConn.m_hVoiceWS);
+        m_VoiceConn.m_hVoiceWS = nullptr;
+    }
+  }
   m_VoiceConn.m_Running = false;
-  // Don't join here to avoid freezing the UI thread.
 }
 
 void DiscordClient::SetVoiceState(bool muted, bool deafened) {
@@ -817,7 +947,13 @@ void DiscordClient::SetAudioDevices(int inputIdx, int outputIdx) {
 std::vector<VoiceMember>
 DiscordClient::GetVoiceMembers(const std::string &channel_id) {
   std::lock_guard<std::mutex> lock(m_VoiceMutex);
-  return m_VoiceMembers;
+  std::vector<VoiceMember> filtered;
+  for (const auto &m : m_VoiceMembers) {
+    if (m.m_ChannelId == channel_id) {
+      filtered.push_back(m);
+    }
+  }
+  return filtered;
 }
 
 void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
@@ -837,23 +973,30 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
   DebugLog("[VOICE] Cleaned endpoint: " + endpoint +
            " port: " + std::to_string(port));
 
-  HINTERNET hSession =
-      WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36", 
-                  WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  HINTERNET hSession = WinHttpOpen(
+      L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+      WINHTTP_NO_PROXY_BYPASS, 0);
   if (!hSession)
     return;
   HINTERNET hConnect = WinHttpConnect(
       hSession, std::wstring(endpoint.begin(), endpoint.end()).c_str(),
-      (INTERNET_PORT)port, 0);
+      (INTERNET_PORT)443, 0);
   HINTERNET hRequest =
-      WinHttpOpenRequest(hConnect, L"GET", L"/?v=4", NULL, WINHTTP_NO_REFERER,
+      WinHttpOpenRequest(hConnect, L"GET", L"/?v=8", NULL, WINHTTP_NO_REFERER,
                          WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
 
   WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
-  
-  LPCWSTR headers = L"Origin: https://discord.com\r\n";
-  if (!WinHttpSendRequest(hRequest, headers, (DWORD)-1L,
+  DWORD secureProtocols = 0x00000800 | 0x00002000; // TLS 1.2 | TLS 1.3
+  WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURE_PROTOCOLS, &secureProtocols, sizeof(secureProtocols));
+
+  std::string hostHeader = "Host: " + endpoint + ":443\r\n";
+  std::wstring wHeaders(L"Origin: https://discord.com\r\n"
+                        L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+                        L"Accept-Language: en-US,en;q=0.9\r\n");
+  wHeaders += std::wstring(hostHeader.begin(), hostHeader.end());
+
+  if (!WinHttpSendRequest(hRequest, wHeaders.c_str(), (DWORD)-1L,
                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
       !WinHttpReceiveResponse(hRequest, NULL)) {
     DebugLog("[VOICE] WinHttpSendRequest or ReceiveResponse failed");
@@ -871,9 +1014,14 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
     WinHttpCloseHandle(hSession);
     return;
   }
+
+  {
+      std::lock_guard<std::mutex> lock(m_WsMutex);
+      m_VoiceConn.m_hVoiceWS = (HINTERNET)hVoiceWS;
+  }
+
   DebugLog("[VOICE] WebSocket Upgrade SUCCESS. Sending Identify Op 0.");
 
-  m_VoiceConn.m_hVoiceWS = hVoiceWS;
   DebugLog("[VOICE] WebSocket connected, waiting for Hello...");
 
   SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, 0);
@@ -904,8 +1052,10 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
       USHORT code = 0;
       BYTE reason[128];
       DWORD reasonLen = 0;
-      WinHttpWebSocketQueryCloseStatus(hVoiceWS, &code, reason, sizeof(reason), &reasonLen);
-      DebugLog("[VOICE] Connection closed by server. Code: " + std::to_string(code));
+      WinHttpWebSocketQueryCloseStatus(hVoiceWS, &code, reason, sizeof(reason),
+                                       &reasonLen);
+      DebugLog("[VOICE] Connection closed by server. Code: " +
+               std::to_string(code));
       break;
     }
 
@@ -916,6 +1066,7 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
       auto d = j["d"];
 
       if (op == 2) { // READY
+        DebugLog("[VOICE] AUTHENTICATION SUCCESS! Received READY (Op 2)");
         OutputDebugStringA("[VOICE] Received READY (Op 2)\n");
         uint32_t ssrc = d["ssrc"].get<uint32_t>();
         m_VoiceConn.m_Ssrc = ssrc; // BUG FIX: was never stored
@@ -1001,32 +1152,51 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
         }
       } else if (op == 4) { // SESSION_DESCRIPTION
         DebugLog("[VOICE] Received SESSION_DESCRIPTION (Op 4) - READY!");
-        OutputDebugStringA("[VOICE] Received SESSION_DESCRIPTION (Op 4) - READY!\n");
+        OutputDebugStringA(
+            "[VOICE] Received SESSION_DESCRIPTION (Op 4) - READY!\n");
         m_VoiceConn.m_SecretKey = d["secret_key"].get<std::vector<uint8_t>>();
         m_VoiceConn.m_Ready = true;
         m_VoiceReady = true;
         std::thread(&DiscordClient::AudioCaptureLoop, this).detach();
       } else if (op == 8) { // HELLO
-        DebugLog("[VOICE] Received HELLO (Op 8). Sending Identify.");
-        
-        // Revert to a clean, standard Identify payload
-        json identify = {
-            {"op", 0},
-            {"d", {
-                {"server_id", guildId},
-                {"user_id", userId},
-                {"session_id", sessionId},
-                {"token", token},
-                {"video", false},
-                {"streams", json::array()},
-                {"v", 4},
-                {"capabilities", 121}
-            }}
-        };
-        
+        DebugLog("[VOICE] Received HELLO (Op 8). Identifying.");
+
+        // Wait for the backend to sync
+        Sleep(500);
+
+        DebugLog("[VOICE] Handshake - Using Session ID: " + sessionId);
+
+        nlohmann::ordered_json identify;
+        if (guildId.empty()) {
+            // Simplified DM handshake (Standard V8 - Key Ordered)
+            identify["op"] = 0;
+            nlohmann::ordered_json d;
+            d["token"] = token;
+            d["user_id"] = [userId]() { try { return (json)std::stoll(userId); } catch(...) { return (json)userId; } }();
+            d["server_id"] = m_VoiceConn.m_ChannelId;
+            d["session_id"] = sessionId;
+            d["video"] = false;
+            d["streams"] = json::array();
+            d["capabilities"] = 65535;
+            identify["d"] = d;
+        } else {
+            // Absolute Fidelity Guild Handshake
+            identify = {{"op", 0},
+                        {"d",
+                         {{"token", token},
+                          {"user_id", [userId]() { try { return (json)std::stoll(userId); } catch(...) { return (json)userId; } }()},
+                          {"server_id", [guildId]() { try { return (json)std::stoll(guildId); } catch(...) { return (json)guildId; } }()},
+                          {"session_id", sessionId},
+                          {"video", false},
+                          {"streams", json::array()},
+                          {"capabilities", 16383},
+                          {"compress", false}}}};
+        }
+
         std::string sId = identify.dump();
         DebugLog("[VOICE] Sending Identify: " + sId);
-        WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+        WinHttpWebSocketSend(hVoiceWS,
+                             WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
                              (void *)sId.c_str(), (DWORD)sId.size());
 
         int interval = d["heartbeat_interval"];
@@ -1048,11 +1218,19 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
   m_VoiceConn.m_Ready = false;
   delete[] pbBuffer;
   closesocket(udpSocket);
-  WinHttpWebSocketClose(hVoiceWS, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL,
-                        0);
-  WinHttpCloseHandle(hVoiceWS);
+  
+  {
+    std::lock_guard<std::mutex> lock(m_WsMutex);
+    if (m_VoiceConn.m_hVoiceWS) {
+        WinHttpWebSocketClose((HINTERNET)m_VoiceConn.m_hVoiceWS, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+        WinHttpCloseHandle((HINTERNET)m_VoiceConn.m_hVoiceWS);
+        m_VoiceConn.m_hVoiceWS = nullptr;
+    }
+  }
   WinHttpCloseHandle(hConnect);
   WinHttpCloseHandle(hSession);
+  m_VoiceConn.m_Running = false;
+  DebugLog("[VOICE] Loop finished and handles cleaned.");
 }
 
 void DiscordClient::AudioCaptureLoop() {
@@ -1092,7 +1270,8 @@ void DiscordClient::AudioCaptureLoop() {
 
     // Nonce for xsalsa20_poly1305_suffix (24 random bytes)
     unsigned char nonce[24] = {0};
-    for (int i = 0; i < 24; ++i) nonce[i] = rand() % 256;
+    for (int i = 0; i < 24; ++i)
+      nonce[i] = rand() % 256;
 
     // Encrypt (libsodium)
     unsigned char encrypted[512] = {0};
@@ -1107,7 +1286,7 @@ void DiscordClient::AudioCaptureLoop() {
       memcpy(rtp_packet + 12, encrypted, (size_t)encrypted_len);
       // Append the 24-byte nonce suffix
       memcpy(rtp_packet + 12 + encrypted_len, nonce, 24);
-      
+
       sendto(m_VoiceConn.m_UdpSocket, (char *)rtp_packet,
              12 + (int)encrypted_len + 24, 0,
              (struct sockaddr *)&m_VoiceConn.m_ServerAddr,
@@ -1164,14 +1343,17 @@ void DiscordClient::SendThreadLoop() {
   }
 }
 
-void DiscordClient::ParseVoiceStateUpdate(const nlohmann::json& d) {
-    std::string userId    = d.value("user_id", "");
-    std::string channelId = (d.contains("channel_id") && !d["channel_id"].is_null())
-                            ? d["channel_id"].get<std::string>() : "";
-    
-    DebugLog("[GATEWAY] ParseVoiceStateUpdate: user=" + userId + " channel=" + channelId);
-    
-    // Try to grab display name and avatar from the embedded member/user object
+void DiscordClient::ParseVoiceStateUpdate(const nlohmann::json &d) {
+  std::string userId = d.value("user_id", "");
+  std::string channelId =
+      (d.contains("channel_id") && !d["channel_id"].is_null())
+          ? d["channel_id"].get<std::string>()
+          : "";
+
+  DebugLog("[GATEWAY] ParseVoiceStateUpdate: user=" + userId +
+           " channel=" + channelId);
+
+  // Try to grab display name and avatar from the embedded member/user object
   std::string displayName = "User " + userId.substr(0, 4);
   std::string avatarHash = "";
   std::string username = "";
@@ -1202,39 +1384,74 @@ void DiscordClient::ParseVoiceStateUpdate(const nlohmann::json& d) {
       avatarHash = u["avatar"].get<std::string>();
     if (u.contains("username"))
       username = u["username"].get<std::string>();
-  }    std::lock_guard<std::mutex> vl(m_VoiceMutex);
-    if (channelId.empty()) {
-        DebugLog("[GATEWAY] User " + userId + " left channel. Clearing.");
-        for (auto it = m_VoiceMembers.begin(); it != m_VoiceMembers.end(); ++it) {
-            if (it->m_Id == userId) {
-                m_VoiceMembers.erase(it);
-                break;
-            }
-        }
-    } else {
-        bool found = false;
-        for (auto& m : m_VoiceMembers) {
-            if (m.m_Id == userId) {
-                m.m_IsMuted    = d.value("mute", false) || d.value("self_mute", false);
-                m.m_IsDeafened = d.value("deaf", false) || d.value("self_deaf", false);
-                m.m_ChannelId  = channelId;
-                if (!displayName.empty()) m.m_DisplayName = displayName;
-                if (!avatarHash.empty())  m.m_AvatarHash  = avatarHash;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            VoiceMember vm;
-            vm.m_Id          = userId;
-            vm.m_Username    = username.empty() ? ("User " + userId.substr(0,4)) : username;
-            vm.m_DisplayName = displayName;
-            vm.m_AvatarHash  = avatarHash;
-            vm.m_ChannelId   = channelId;
-            vm.m_IsMuted     = d.value("mute", false) || d.value("self_mute", false);
-            vm.m_IsDeafened  = d.value("deaf", false) || d.value("self_deaf", false);
-            m_VoiceMembers.push_back(vm);
-            DebugLog("[GATEWAY] Added new voice member. Total: " + std::to_string(m_VoiceMembers.size()));
-        }
+  }
+  std::lock_guard<std::mutex> vl(m_VoiceMutex);
+  if (channelId.empty()) {
+    DebugLog("[GATEWAY] User " + userId + " left channel. Clearing.");
+    for (auto it = m_VoiceMembers.begin(); it != m_VoiceMembers.end(); ++it) {
+      if (it->m_Id == userId) {
+        m_VoiceMembers.erase(it);
+        break;
+      }
+    }
+  } else {
+    bool found = false;
+    for (auto &m : m_VoiceMembers) {
+      if (m.m_Id == userId) {
+        m.m_IsMuted = d.value("mute", false) || d.value("self_mute", false);
+        m.m_IsDeafened = d.value("deaf", false) || d.value("self_deaf", false);
+        m.m_ChannelId = channelId;
+        if (!displayName.empty())
+          m.m_DisplayName = displayName;
+        if (!avatarHash.empty())
+          m.m_AvatarHash = avatarHash;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      VoiceMember vm;
+      vm.m_Id = userId;
+      vm.m_Username =
+          username.empty() ? ("User " + userId.substr(0, 4)) : username;
+      vm.m_DisplayName = displayName;
+      vm.m_AvatarHash = avatarHash;
+      vm.m_ChannelId = channelId;
+      vm.m_IsMuted = d.value("mute", false) || d.value("self_mute", false);
+      vm.m_IsDeafened = d.value("deaf", false) || d.value("self_deaf", false);
+      m_VoiceMembers.push_back(vm);
+      DebugLog("[GATEWAY] Added new voice member. Total: " +
+               std::to_string(m_VoiceMembers.size()));
     }
   }
+}
+
+bool DiscordClient::StartCall(const std::string &channel_id) {
+  DebugLog("[CALL] Starting DM call in channel: " + channel_id);
+  
+  DebugLog("[CALL] Joining voice...");
+  JoinVoiceChannel("", channel_id);
+  
+  DebugLog("[CALL] Sending Ring request...");
+  std::string resp = HttpRequest("POST", "/api/v9/channels/" + channel_id + "/call/ring", "{\"recipients\":null}");
+  
+  DebugLog("[CALL] Ring request finished. Success: " + std::string(resp.empty() ? "No" : "Yes"));
+  return !resp.empty();
+}
+
+bool DiscordClient::EndCall(const std::string &channel_id) {
+  DebugLog("[CALL] Ending call in channel: " + channel_id);
+  LeaveVoiceChannel("");
+  return true;
+}
+
+bool DiscordClient::AcceptCall(const std::string &channel_id) {
+  DebugLog("[CALL] Accepting call in channel: " + channel_id);
+  return JoinVoiceChannel("", channel_id);
+}
+
+bool DiscordClient::DeclineCall(const std::string &channel_id) {
+  DebugLog("[CALL] Declining call in channel: " + channel_id);
+  std::string resp = HttpRequest("POST", "/api/v9/channels/" + channel_id + "/call/stop-ringing", "{\"recipients\":null}");
+  return !resp.empty();
+}

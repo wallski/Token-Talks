@@ -58,7 +58,6 @@ struct VoiceMember {
 struct VoiceConnection {
     std::string m_Endpoint;
     std::string m_Token;
-    std::string m_SessionId;
     std::string m_GuildId;
     std::string m_ChannelId;
     uint32_t    m_Ssrc = 0;
@@ -103,6 +102,7 @@ public:
     // Token / auth
     void        SetToken(const std::string& token);
     std::string GetToken()  const;
+    std::string GetSessionId() const;
     std::string GetUserId() const;
     std::string GetUserName() const;
     std::string GetUserAvatar() const;
@@ -130,6 +130,7 @@ public:
     // Callbacks
     void SetOnMessageCallback(std::function<void(const DiscordMessage&)> cb);
     void SetOnConnectedCallback(std::function<void()> cb);
+    void SetOnCallCallback(std::function<void(const std::string& channel_id, const std::string& user_name)> cb);
 
     // Voice
     bool JoinVoiceChannel(const std::string& guild_id, const std::string& channel_id);
@@ -138,6 +139,12 @@ public:
     void SetVoiceState(bool muted, bool deafened);
     void SetAudioDevices(int inputIdx, int outputIdx);
     void SubscribeToGuild(const std::string& guildId);
+    
+    // DM Calls
+    bool StartCall(const std::string& channel_id);
+    bool EndCall(const std::string& channel_id);
+    bool AcceptCall(const std::string& channel_id);
+    bool DeclineCall(const std::string& channel_id);
 
     // Public state (read by GUI)
     VoiceConnection          m_VoiceConn;
@@ -150,8 +157,9 @@ private:
     std::string         m_UserId;
     std::string         m_DisplayName;
     std::string         m_AvatarHash;
-    std::string         m_SessionId;
-    std::string         m_VoiceSessionId;
+    std::string         m_SessionId;       // Main Gateway Session ID
+    std::string         m_VoiceSessionId;  // Voice Gateway Session ID
+    std::mutex          m_IdMutex;         // Protects session/user IDs
     int                 m_HeartbeatInterval = 41250;
     int                 m_SequenceNumber    = 0;
 
@@ -167,6 +175,7 @@ private:
 
     std::function<void(const DiscordMessage&)> m_MessageCallback;
     std::function<void()>                      m_ConnectedCallback;
+    std::function<void(const std::string&, const std::string&)> m_CallCallback;
 
     // Internal methods
     void WebSocketLoop();

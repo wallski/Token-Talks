@@ -49,7 +49,7 @@ bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
 void CleanupRenderTarget();
-
+extern void DebugLog(const std::string& msg);
 static DiscordClient gc;
 static std::vector<DiscordGuild> g_Guilds;
 static std::vector<DiscordChannel> g_Channels;
@@ -86,6 +86,9 @@ static bool g_IsFetchingMessages = false;
 static bool g_RefocusInput = false;
 static bool g_WasAtTop = false;       // edge-detect for infinite scroll
 static std::string g_RestoreMsgId = ""; // exactly anchor the scroll when prepending
+static bool g_IncomingCall = false;
+static std::string g_IncomingCallChannelId = "";
+static std::string g_IncomingCallUserName = "";
 
 static std::vector<std::string> g_InputDevices;
 static std::vector<std::string> g_OutputDevices;
@@ -500,6 +503,16 @@ void OnDiscordMessage(const DiscordMessage& msg) {
     }
 }
 
+void OnIncomingCall(const std::string& cid, const std::string& name) {
+    if (name == "STOP") {
+        g_IncomingCall = false;
+        return;
+    }
+    g_IncomingCall = true;
+    g_IncomingCallChannelId = cid;
+    g_IncomingCallUserName = name;
+}
+
 void DrawDashboard() {
     ImVec2 vp_size = ImGui::GetMainViewport()->Size;
     ImVec2 vp_pos = ImGui::GetMainViewport()->Pos;
@@ -517,6 +530,14 @@ void DrawDashboard() {
     float sidebarW = 240.0f;
     ImGui::SetCursorPos({20, 40});
     ImGui::BeginGroup();
+
+    // Debug: Log session state once it's captured
+    static bool loggedSession = false;
+    if (!loggedSession && !gc.GetToken().empty() && !gc.GetSessionId().empty()) {
+        DebugLog("[DASHBOARD] Identity Confirmed - Session: " + gc.GetSessionId() + " User: " + gc.GetUserId());
+        loggedSession = true;
+    }
+
     ImGui::TextDisabled("SAVED ACCOUNTS");
     ImGui::Dummy({0, 10});
 
@@ -637,6 +658,57 @@ void DrawMfaModal() {
         }
         ImGui::EndPopup();
     }
+}
+
+void DrawIncomingCallOverlay() {
+    if (!g_IncomingCall) return;
+
+    ImVec2 vp_size = ImGui::GetMainViewport()->Size;
+    float boxW = 320.0f, boxH = 160.0f;
+    ImGui::SetNextWindowPos({(vp_size.x - boxW) * 0.5f, 100});
+    ImGui::SetNextWindowSize({boxW, boxH});
+    
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.15f, 0.16f, 0.18f, 0.95f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
+    ImGui::Begin("IncomingCallPopup", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+
+    ImGui::SetCursorPosY(25);
+    std::string txt = "INCOMING CALL";
+    float txtW = ImGui::CalcTextSize(txt.c_str()).x;
+    ImGui::SetCursorPosX((boxW - txtW) * 0.5f);
+    ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "%s", txt.c_str());
+
+    ImGui::SetCursorPosY(55);
+    std::string userTxt = g_IncomingCallUserName;
+    float userW = ImGui::CalcTextSize(userTxt.c_str()).x;
+    ImGui::SetCursorPosX((boxW - userW) * 0.5f);
+    ImGui::TextUnformatted(userTxt.c_str());
+
+    ImGui::SetCursorPosY(100);
+    ImGui::SetCursorPosX((boxW - 220) * 0.5f);
+    
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
+    if (ImGui::Button("ACCEPT", {100, 38})) {
+        gc.AcceptCall(g_IncomingCallChannelId);
+        g_IncomingCall = false;
+        g_ShowCallView = true;
+        g_ActiveVoiceChannelId = g_IncomingCallChannelId;
+        g_ActiveVoiceChannelName = "Private Call";
+    }
+    ImGui::PopStyleColor();
+
+    ImGui::SameLine(0, 20);
+
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
+    if (ImGui::Button("DECLINE", {100, 38})) {
+        gc.DeclineCall(g_IncomingCallChannelId);
+        g_IncomingCall = false;
+    }
+    ImGui::PopStyleColor();
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
 }
 
 void DrawCallView() {
@@ -1057,6 +1129,20 @@ void DrawMainApp() {
             {std::lock_guard<std::mutex> lk(g_DataMutex);for(auto&c:g_Channels)if(c.id==g_SelectedChannelId){ch_hdr=(c.type==2?"(vc) ":"# ")+c.name;break;}}
             ImGui::SetCursorPosX(14);
             ImGui::PushStyleColor(ImGuiCol_Text,{0.95f,0.96f,0.98f,1.f});ImGui::TextUnformatted(ch_hdr.c_str());ImGui::PopStyleColor();
+
+            // Add Call Button for DMs
+            if (g_SelectedGuildId.empty() && !g_SelectedChannelId.empty()) {
+                ImGui::SameLine(ImGui::GetWindowWidth() - 60);
+                if (ImGui::Button("CALL", {40, 24})) {
+                    std::string cid = g_SelectedChannelId;
+                    std::thread([cid]() {
+                        gc.StartCall(cid);
+                    }).detach();
+                    g_ActiveVoiceChannelId = g_SelectedChannelId;
+                    g_ActiveVoiceChannelName = "Private Call";
+                    g_ShowCallView = true;
+                }
+            }
             ImGui::Dummy({0,4});
         }
         // Messages — height leaves room for input bar + optional compose staging
@@ -1279,6 +1365,8 @@ void DrawMainApp() {
 
     ImGui::EndChild();ImGui::PopStyleVar();ImGui::PopStyleColor();
     ImGui::End();
+    
+    DrawIncomingCallOverlay();
 }
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1334,6 +1422,9 @@ int RunGUI() {
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    gc.SetOnMessageCallback(OnDiscordMessage);
+    gc.SetOnCallCallback(OnIncomingCall);
 
     LoadAccountsGUI();
 
