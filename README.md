@@ -2,7 +2,7 @@
 
 # Token-Talks
 
-**A native, high-performance Discord client built entirely in C++ with zero browser overhead.**
+**A native, high-performance Discord client built in C++ with zero browser overhead.**
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?style=flat-square)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-informational?style=flat-square)
@@ -13,124 +13,86 @@
 
 ---
 
-## What is Token-Talks?
+## Overview
 
-Token-Talks is a fully featured Discord desktop client written from scratch in native C++.  
-No Electron. No web engine. No heavy runtimes. Just raw DirectX 11 rendering, WinHTTP networking, and ImGui — giving you a lightweight, ultra-fast messaging experience.
+Token-Talks is a native Discord desktop client developed in C++. By bypassing Electron and traditional web-based runtimes, it achieves extremely low latency and a minimal resource footprint. The application utilizes DirectX 11 for rendering and Dear ImGui for its highly optimized user interface.
 
 ---
 
-## Features
+## Core Features
 
 ### Messaging
-- Real-time message receiving via **Discord Gateway WebSockets**
-- Send messages to any text channel
-- **Edit** and **Delete** your own messages via right-click context menu
-- Full message history loading (last 50 messages)
+- **Modern Chat Interface**: High-fidelity layout featuring circular avatars, display names, and optimized message spacing.
+- **Infinite Scrolling**: Automatic lazy-loading of message history as the user scrolls.
+- **Direct Messaging**: Dedicated support for private conversations and group DMs.
+- **Reactions**: View and interact with emoji reactions on any message.
+- **Message Lifecycle**: Full integration for sending, editing, and deleting messages.
 
-### Media
-- Inline image and GIF rendering powered by **stb_image + DirectX 11 textures**
-- Multiple attachments per message displayed correctly
-- File upload support (PNG, JPG, GIF) via native Windows file picker
-- Async media downloading — UI never freezes while images load
+### Media & Rendering
+- **GIF Playback**: High-performance GIF decoding and real-time playback.
+- **Native Video**: Integrated video support utilizing the Windows Media Foundation (WMF) pipeline.
+- **Lightbox**: Full-screen overlay for detailed inspection of images and video content.
+- **Asynchronous Pipeline**: Media assets are downloaded and decoded on background threads to ensure consistent 60+ FPS performance.
 
-### Navigation
-- Full **Server → Channel → Chat** three-panel layout
-- Private/locked channel detection with role permission parsing (including category inheritance)
-- Toggle to show or hide private channels you don't have access to
+### Audio & Voice (Experimental)
+- **Voice Channels**: Support for joining guild voice channels and initiating direct calls.
+- **Audio Routing**: Comprehensive configuration for input/output device selection and volume control.
+- **Signaling**: Integrated ringing and call state management.
+- **Codec Support**: Built with **libopus** for encoding/decoding and **libsodium** for encryption.
 
-### Accounts
-- Multi-account support — save and switch between accounts instantly
-- Token validation before saving (verified against Discord API)
-- Tokens stored **XOR-encrypted + hex-encoded** on disk — never plain text
-
-### Themes & Settings
-- 5 built-in professional themes:
-  - **Modern Blurple** — Discord-inspired dark mode
-  - **Midnight Stealth** — pure OLED black
-  - **Ruby Crimson** — deep red aesthetic
-  - **Classic Light** — clean white mode
-  - **Amethyst Dark** — deep purple dark mode
-- Settings persist across restarts via `settings.json`
+### Customization & Privacy
+- **Themes**: Multiple built-in professional themes (Blurple, Midnight, Ruby, Light, Amethyst).
+- **Custom Typography**: Support for external `.ttf` and `.otf` font assets.
+- **Visibility Control**: Toggle to show or hide locked/private channels.
 
 ---
 
-## Tech Stack
+## Technical Specifications
 
 | Component | Technology |
 |---|---|
-| UI Framework | [Dear ImGui](https://github.com/ocornut/imgui) (Docking branch) |
-| Renderer | DirectX 11 |
-| Networking | Windows WinHTTP (native, no libcurl) |
-| Image Decoding | [stb_image](https://github.com/nothings/stb) |
-| JSON Parsing | [nlohmann/json](https://github.com/nlohmann/json) |
-| Build System | Visual Studio 2022 (MSVC) |
+| **UI Framework** | Dear ImGui (Docking) |
+| **Renderer** | DirectX 11 (D3D11) |
+| **Networking** | Native Windows WinHTTP |
+| **Audio Codec** | libopus |
+| **Encryption** | libsodium |
+| **Video Pipeline** | Windows Media Foundation |
+| **Image Pipeline** | stb_image |
+| **JSON Parser** | nlohmann/json |
 
 ---
 
-## Building
+## Building from Source
 
-### Requirements
+### Prerequisites
 - Windows 10 / 11
-- Visual Studio 2022 with **Desktop C++ workload**
-- No external package manager needed — all dependencies are vendored
+- Visual Studio 2022 (Desktop C++ Workload)
+- All dependencies are included in the `/vendor` directory.
 
-### Steps
+### Build Instructions
 
 1. Clone the repository:
    ```bash
    git clone https://github.com/wallski/Token-Talks.git
    ```
-
-2. Open `dailyrem.sln` in Visual Studio 2022
-
-3. Set configuration to **Release | x64**
-
-4. Hit **Build → Build Solution**
-
-5. Run the output executable
-
-> The app hides the console window on launch. Everything happens in the ImGui window.
-
----
-
-## Usage
-
-1. Launch the app
-2. On the dashboard, enter a **display name** and your **Discord token**
-3. Click **Add Account** — the token is validated against the API before saving
-4. Click your account name to log in
-5. Browse your servers → channels → chat
-
-> **Right-click** any message you sent to edit or delete it.  
-> Click the **`+`** button next to the chat input to upload an image.  
-> Access **Settings** from the top-right button to change themes or toggle private channels.
-
----
-
-## Security Notice
-
-Token-Talks stores your Discord token locally in an encrypted format (`accounts.dat`).  
-Tokens are XOR-obfuscated and hex-encoded before being written to disk.
-
-> ⚠️ **Never share your `accounts.dat` file or your raw Discord token with anyone.**  
-> Using a user token against Discord's Terms of Service is done at your own risk.
+2. Open `dailyrem.sln` in Visual Studio 2022.
+3. Select the **Release | x64** configuration.
+4. Execute **Build → Build Solution**.
+5. The executable is located in the `x64/Release` directory.
 
 ---
 
 ## Roadmap
 
-- [ ] Animated GIF playback
-- [ ] Video support  
-- [ ] Voice channel support (libopus + libsodium)
-- [ ] Message reactions
-- [ ] Direct Messages panel
-- [ ] Custom font support in Settings
+- [ ] **Voice E2EE (MLS)**: Implementation of Discord's mandatory end-to-end encryption for voice connections.
+- [ ] **Global Search**: Integration for message and server-wide searching.
+- [ ] **Discord RPC**: Native Game Activity and Rich Presence support.
+- [ ] **Extensibility**: Support for custom themes and client-side plugins.
 
 ---
 
 <div align="center">
 
-Built with 💜 using pure C++ and zero Electron.
+Built with native C++ and zero Electron overhead.
 
 </div>

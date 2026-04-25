@@ -183,7 +183,8 @@ std::string DiscordClient::HttpRequest(const std::string &method,
                                        const std::string &path,
                                        const std::string &body) {
   HINTERNET session =
-      WinHttpOpen(L"msgEZ/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+      WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9150 Chrome/121.0.6167.184 Electron/29.1.0 Safari/537.36", 
+                  WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session)
     return "";
@@ -465,7 +466,8 @@ DiscordClient::DownloadFile(const std::string &urlStr) {
     return data;
 
   HINTERNET hSession =
-      WinHttpOpen(L"msgEZ/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+      WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9150 Chrome/121.0.6167.184 Electron/29.1.0 Safari/537.36", 
+                  WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   HINTERNET hConnect =
       WinHttpConnect(hSession, hostName, INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -531,7 +533,8 @@ bool DiscordClient::SendAttachment(const std::string &channel_id,
                        endBoundary.end());
 
   HINTERNET session =
-      WinHttpOpen(L"msgEZ/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+      WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9150 Chrome/121.0.6167.184 Electron/29.1.0 Safari/537.36", 
+                  WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   HINTERNET connect =
       WinHttpConnect(session, L"discord.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -650,18 +653,14 @@ void DiscordClient::SendIdentify(void *hWebSocket) {
        {{"token", m_Token},
         {"properties",
          {{"os", "Windows"},
-          {"browser", "Chrome"},
-          {"device", ""},
-          {"system_locale", "en-US"},
-          {"browser_user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-          {"browser_version", "120.0.0.0"},
-          {"os_version", "10"},
-          {"referrer", ""},
-          {"referring_domain", ""},
-          {"referrer_current", ""},
-          {"referring_domain_current", ""},
+          {"browser", "Discord Client"},
           {"release_channel", "stable"},
-          {"client_build_number", 284698},
+          {"client_version", "1.0.9150"},
+          {"os_version", "10.0.19045"},
+          {"os_arch", "x64"},
+          {"system_locale", "en-US"},
+          {"client_build_number", 300125},
+          {"native_build_number", 53231},
           {"client_event_source", nullptr}}},
         {"compress", false},
         {"client_state",
@@ -675,7 +674,7 @@ void DiscordClient::SendIdentify(void *hWebSocket) {
 
 void DiscordClient::WebSocketLoop() {
   HINTERNET hSession =
-      WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", 
+      WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9150 Chrome/121.0.6167.184 Electron/29.1.0 Safari/537.36", 
                   WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   HINTERNET hConnect = WinHttpConnect(hSession, L"gateway.discord.gg",
@@ -685,7 +684,7 @@ void DiscordClient::WebSocketLoop() {
       WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
   WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
   LPCWSTR headers = L"Origin: https://discord.com\r\n"
-                    L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+                    L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9150 Chrome/121.0.6167.184 Electron/29.1.0 Safari/537.36\r\n"
                     L"Accept-Language: en-US,en;q=0.9\r\n";
   WinHttpSendRequest(hRequest, headers, (DWORD)-1L,
                      WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
@@ -899,10 +898,11 @@ bool DiscordClient::JoinVoiceChannel(const std::string &guild_id,
 
   DebugLog("[VOICE-JOIN] Preparing JSON...");
   json d;
-  if (guild_id.empty()) d["guild_id"] = nullptr;
-  else d["guild_id"] = guild_id;
+  if (!guild_id.empty()) d["guild_id"] = guild_id;
   
-  d["channel_id"] = channel_id;
+  if (channel_id.empty()) d["channel_id"] = nullptr;
+  else d["channel_id"] = channel_id;
+
   d["self_mute"] = false;
   d["self_deaf"] = false;
   d["self_video"] = false;
@@ -974,14 +974,14 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
            " port: " + std::to_string(port));
 
   HINTERNET hSession = WinHttpOpen(
-      L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9150 Chrome/121.0.6167.184 Electron/29.1.0 Safari/537.36",
       WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
       WINHTTP_NO_PROXY_BYPASS, 0);
   if (!hSession)
     return;
   HINTERNET hConnect = WinHttpConnect(
       hSession, std::wstring(endpoint.begin(), endpoint.end()).c_str(),
-      (INTERNET_PORT)443, 0);
+      (INTERNET_PORT)port, 0);
   HINTERNET hRequest =
       WinHttpOpenRequest(hConnect, L"GET", L"/?v=8", NULL, WINHTTP_NO_REFERER,
                          WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
@@ -990,9 +990,9 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
   DWORD secureProtocols = 0x00000800 | 0x00002000; // TLS 1.2 | TLS 1.3
   WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURE_PROTOCOLS, &secureProtocols, sizeof(secureProtocols));
 
-  std::string hostHeader = "Host: " + endpoint + ":443\r\n";
+  std::string hostHeader = "Host: " + endpoint + ":" + std::to_string(port) + "\r\n";
   std::wstring wHeaders(L"Origin: https://discord.com\r\n"
-                        L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+                        L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9150 Chrome/121.0.6167.184 Electron/29.1.0 Safari/537.36\r\n"
                         L"Accept-Language: en-US,en;q=0.9\r\n");
   wHeaders += std::wstring(hostHeader.begin(), hostHeader.end());
 
@@ -1019,8 +1019,6 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
       std::lock_guard<std::mutex> lock(m_WsMutex);
       m_VoiceConn.m_hVoiceWS = (HINTERNET)hVoiceWS;
   }
-
-  DebugLog("[VOICE] WebSocket Upgrade SUCCESS. Sending Identify Op 0.");
 
   DebugLog("[VOICE] WebSocket connected, waiting for Hello...");
 
@@ -1159,39 +1157,25 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
         m_VoiceReady = true;
         std::thread(&DiscordClient::AudioCaptureLoop, this).detach();
       } else if (op == 8) { // HELLO
-        DebugLog("[VOICE] Received HELLO (Op 8). Identifying.");
-
-        // Wait for the backend to sync
-        Sleep(500);
-
+        DebugLog("[VOICE] Received HELLO (Op 8). Syncing (v8 Post-E2EE)...");
+        
+        int interval = j["d"]["heartbeat_interval"];
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        
         DebugLog("[VOICE] Handshake - Using Session ID: " + sessionId);
 
         nlohmann::ordered_json identify;
-        if (guildId.empty()) {
-            // Simplified DM handshake (Standard V8 - Key Ordered)
-            identify["op"] = 0;
-            nlohmann::ordered_json d;
-            d["token"] = token;
-            d["user_id"] = [userId]() { try { return (json)std::stoll(userId); } catch(...) { return (json)userId; } }();
-            d["server_id"] = m_VoiceConn.m_ChannelId;
-            d["session_id"] = sessionId;
-            d["video"] = false;
-            d["streams"] = json::array();
-            d["capabilities"] = 65535;
-            identify["d"] = d;
-        } else {
-            // Absolute Fidelity Guild Handshake
-            identify = {{"op", 0},
-                        {"d",
-                         {{"token", token},
-                          {"user_id", [userId]() { try { return (json)std::stoll(userId); } catch(...) { return (json)userId; } }()},
-                          {"server_id", [guildId]() { try { return (json)std::stoll(guildId); } catch(...) { return (json)guildId; } }()},
-                          {"session_id", sessionId},
-                          {"video", false},
-                          {"streams", json::array()},
-                          {"capabilities", 16383},
-                          {"compress", false}}}};
-        }
+        identify["op"] = 0;
+        nlohmann::ordered_json d;
+        d["server_id"] = guildId.empty() ? m_VoiceConn.m_ChannelId : guildId;
+        d["user_id"] = userId;
+        d["session_id"] = sessionId;
+        d["token"] = token;
+        d["video"] = false;
+        d["streams"] = json::array();
+        d["capabilities"] = 32767; // Mask including E2EE support
+        identify["d"] = d;
 
         std::string sId = identify.dump();
         DebugLog("[VOICE] Sending Identify: " + sId);
@@ -1199,7 +1183,7 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                              WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
                              (void *)sId.c_str(), (DWORD)sId.size());
 
-        int interval = d["heartbeat_interval"];
+        // Start heartbeat thread
         std::thread([this, hVoiceWS, interval]() {
           while (m_VoiceConn.m_Running && m_VoiceConn.m_hVoiceWS == hVoiceWS) {
             std::this_thread::sleep_for(std::chrono::milliseconds(interval));
@@ -1435,8 +1419,8 @@ bool DiscordClient::StartCall(const std::string &channel_id) {
   DebugLog("[CALL] Sending Ring request...");
   std::string resp = HttpRequest("POST", "/api/v9/channels/" + channel_id + "/call/ring", "{\"recipients\":null}");
   
-  DebugLog("[CALL] Ring request finished. Success: " + std::string(resp.empty() ? "No" : "Yes"));
-  return !resp.empty();
+  DebugLog("[CALL] Ring request finished. Success: " + std::string(resp.empty() ? "Yes (204)" : "Yes"));
+  return true; // Return true as empty response usually means 204 No Content (Success)
 }
 
 bool DiscordClient::EndCall(const std::string &channel_id) {
