@@ -165,6 +165,7 @@ void DiscordClient::SetOnCallCallback(std::function<void(const std::string&, con
 bool DiscordClient::IsConnected() const { return m_Connected; }
 
 std::string DiscordClient::HttpRequest(const std::string& method, const std::string& path, const std::string& body) {
+    DebugLog("[HTTP] " + method + " " + path);
     HINTERNET session = WinHttpOpen(
         L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9150 Chrome/121.0.6167.184 Electron/29.1.0 Safari/537.36",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -182,11 +183,12 @@ std::string DiscordClient::HttpRequest(const std::string& method, const std::str
     std::wstring wheaders(combinedHeaders.begin(), combinedHeaders.end());
     BOOL sent = WinHttpSendRequest(request, wheaders.c_str(), -1, (LPVOID)body.c_str(),
         (DWORD)body.size(), (DWORD)body.size(), 0);
-    if (!sent) { WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return ""; }
+    if (!sent) { DebugLog("[HTTP] Request failed for " + path); WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return ""; }
     WinHttpReceiveResponse(request, NULL);
     DWORD statusCode = 0;
     DWORD size = sizeof(statusCode);
     WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &statusCode, &size, NULL);
+    DebugLog("[HTTP] Status: " + std::to_string(statusCode));
     std::string responseBody;
     DWORD bytesAvailable = 0;
     while (WinHttpQueryDataAvailable(request, &bytesAvailable) && bytesAvailable > 0) {
@@ -195,6 +197,7 @@ std::string DiscordClient::HttpRequest(const std::string& method, const std::str
         if (WinHttpReadData(request, buffer.data(), bytesAvailable, &bytesRead))
             responseBody.append(buffer.data(), bytesRead);
     }
+    DebugLog("[HTTP] Response length: " + std::to_string(responseBody.size()));
     WinHttpCloseHandle(request);
     WinHttpCloseHandle(connect);
     WinHttpCloseHandle(session);

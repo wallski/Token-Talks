@@ -56,6 +56,8 @@ static std::vector<DiscordChannel> g_Channels;
 static std::vector<DiscordMessage> g_Messages;
 static std::string g_SelectedGuildId;
 static std::string g_SelectedChannelId;
+static bool g_IsRefreshingChannels = false;
+static std::mutex g_RefreshMutex;
 static std::mutex g_DataMutex;
 static std::mutex g_ChatMutex;
 static char g_InputBuffer[1024] = "";
@@ -481,15 +483,26 @@ void RefreshPrivateChannels() {
 }
 
 void RefreshChannels(const std::string& guildId) {
+    {
+        std::lock_guard<std::mutex> lock(g_RefreshMutex);
+        if (g_IsRefreshingChannels) return;
+        g_IsRefreshingChannels = true;
+    }
     auto channels = gc.FetchChannels(guildId);
     std::lock_guard<std::mutex> lock(g_DataMutex);
     g_SelectedGuildId = guildId;
     g_Channels = channels;
     g_SelectedChannelId = "";
+    {
+        std::lock_guard<std::mutex> lock(g_RefreshMutex);
+        g_IsRefreshingChannels = false;
+    }
 }
 
 void RefreshMessages(const std::string& channelId) {
+    DebugLog("[GUI] Refreshing messages for channel: " + channelId);
     auto msgs = gc.FetchMessages(channelId);
+    DebugLog("[GUI] Fetched " + std::to_string(msgs.size()) + " messages");
     std::lock_guard<std::mutex> lock(g_DataMutex);
     if (g_SelectedChannelId == channelId) {
         std::lock_guard<std::mutex> chatLock(g_ChatMutex);
@@ -823,6 +836,8 @@ void DrawCallView() {
 }
 
 void DrawMainApp() {
+    try {
+    static bool loggedEntry = false; if(!loggedEntry){ DebugLog("[GUI] Entering DrawMainApp"); loggedEntry=true; }
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->Pos);
     ImGui::SetNextWindowSize(ImGui::GetMainViewport()->Size);
     ImGui::Begin("MainApp", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
@@ -1024,7 +1039,18 @@ void DrawMainApp() {
     };
     if(serverBtn("__dm__","DMs","",g_SelectedGuildId.empty())) std::thread([](){RefreshPrivateChannels();}).detach();
     {ImVec2 p=ImGui::GetCursorScreenPos();rDL->AddRectFilled({p.x+14,p.y+4},{p.x+RAIL_W-14,p.y+6},IM_COL32(80,80,85,255),1.f);ImGui::Dummy({0,14});}
-    {std::lock_guard<std::mutex> lk(g_DataMutex);for(auto&g:g_Guilds)if(serverBtn(g.id,g.name,g.icon_hash,g.id==g_SelectedGuildId))std::thread([g](){RefreshChannels(g.id); gc.SubscribeToGuild(g.id);}).detach();}
+    {
+        std::lock_guard<std::mutex> lk(g_DataMutex);
+        for(auto&g:g_Guilds) {
+            if(serverBtn(g.id,g.name,g.icon_hash,g.id==g_SelectedGuildId)) {
+                bool alreadyRefreshing = false;
+                { std::lock_guard<std::mutex> rlk(g_RefreshMutex); alreadyRefreshing = g_IsRefreshingChannels; }
+                if (!alreadyRefreshing && g_SelectedGuildId != g.id) {
+                    std::thread([g](){RefreshChannels(g.id); gc.SubscribeToGuild(g.id);}).detach();
+                }
+            }
+        }
+    }
     ImGui::EndChild();ImGui::PopStyleVar();ImGui::PopStyleColor();ImGui::SameLine(0,0);
 
     // ── CHANNEL LIST ─────────────────────────────────────────────
@@ -1067,7 +1093,8 @@ void DrawMainApp() {
                         gc.SetAudioDevices(g_Settings.input_device,g_Settings.output_device);
                         if(gc.JoinVoiceChannel(g_SelectedGuildId,c.id)){g_ActiveVoiceChannelId=c.id;g_ActiveVoiceChannelName=c.name;g_ActiveVoiceGuildId=g_SelectedGuildId;g_ShowCallView=true;}
                     } else {
-                        { std::lock_guard<std::mutex> lk(g_DataMutex); g_SelectedChannelId = c.id; }
+                        g_SelectedChannelId = c.id;
+                        DebugLog("[GUI] Selected text channel: " + c.name + " (" + c.id + ")");
                         std::thread([c](){RefreshMessages(c.id);}).detach();
                     }
                 }
@@ -1101,7 +1128,7 @@ void DrawMainApp() {
                 ImGui::PushStyleColor(ImGuiCol_HeaderActive,{0.24f,0.26f,0.32f,1.f});
                 ImGui::SetCursorPosX(8);
                 if(ImGui::Selectable(c.name.c_str(),sel,0,{CHAN_W-16,28})){
-                    { std::lock_guard<std::mutex> lk(g_DataMutex); g_SelectedChannelId = c.id; }
+                    g_SelectedChannelId = c.id;
                     std::thread([c](){RefreshMessages(c.id);}).detach();
                 }
                 ImGui::PopStyleColor(3);
@@ -1427,6 +1454,11 @@ void DrawMainApp() {
     ImGui::End();
     
     DrawIncomingCallOverlay();
+    } catch (const std::exception& e) {
+        DebugLog("[CRASH] Exception in DrawMainApp: " + std::string(e.what()));
+    } catch (...) {
+        DebugLog("[CRASH] Unknown exception in DrawMainApp");
+    }
 }
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
