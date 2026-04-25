@@ -1176,27 +1176,7 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
         std::string ip = d["ip"].get<std::string>();
         int port = d["port"].get<int>();
 
-        // Dave Initialization & Identity (Op 12)
-        if (m_VoiceConn.m_DaveSession) {
-            uint64_t gId = 0;
-            try {
-                gId = std::stoull(guildId.empty() ? m_VoiceConn.m_ChannelId : guildId);
-            } catch(...) {}
-            daveSessionInit((DAVESessionHandle)m_VoiceConn.m_DaveSession, m_VoiceConn.m_DaveVersion, gId, m_UserId.c_str());
-            
-            uint8_t* kp = nullptr;
-            size_t kpLen = 0;
-            daveSessionGetMarshalledKeyPackage((DAVESessionHandle)m_VoiceConn.m_DaveSession, &kp, &kpLen);
-            if (kp) {
-                std::vector<uint8_t> msg = {0, 0, 12}; // seq, op 12
-                msg.insert(msg.end(), kp, kp + kpLen);
-                WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, msg.data(), (DWORD)msg.size());
-                daveFree(kp);
-                DebugLog("[VOICE] Sent DAVE_IDENTIFY (Op 12) with Key Package");
-            }
-        }
-
-        // BUG FIX: resolve address BEFORE sending any packets
+        // Resolve address for UDP discovery
         struct addrinfo hints = {}, *res = nullptr;
         hints.ai_family = AF_INET;
         if (getaddrinfo(ip.c_str(), std::to_string(port).c_str(), &hints,
@@ -1205,11 +1185,19 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
           m_VoiceConn.m_ServerAddr = *(struct sockaddr_in *)res->ai_addr;
           freeaddrinfo(res);
         } else {
-          // Fallback: manual inet_pton
           m_VoiceConn.m_ServerAddr = {};
           m_VoiceConn.m_ServerAddr.sin_family = AF_INET;
           m_VoiceConn.m_ServerAddr.sin_port = htons((u_short)port);
           inet_pton(AF_INET, ip.c_str(), &m_VoiceConn.m_ServerAddr.sin_addr);
+        }
+
+        // Initialize Dave Session (Ready for Op 4)
+        if (m_VoiceConn.m_DaveSession) {
+            uint64_t gId = 0;
+            try {
+                gId = std::stoull(guildId.empty() ? m_VoiceConn.m_ChannelId : guildId);
+            } catch(...) {}
+            daveSessionInit((DAVESessionHandle)m_VoiceConn.m_DaveSession, m_VoiceConn.m_DaveVersion, gId, m_UserId.c_str());
         }
 
         // IP Discovery packet (type=1, length=70, ssrc)
@@ -1283,6 +1271,20 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
             m_VoiceConn.m_DaveVersion = d["dave_protocol_version"].get<uint16_t>();
             DebugLog("[VOICE] DAVE Protocol Negotiated: v" + std::to_string(m_VoiceConn.m_DaveVersion));
             
+            // NOW we send DAVE_IDENTIFY
+            if (m_VoiceConn.m_DaveSession) {
+                uint8_t* kp = nullptr;
+                size_t kpLen = 0;
+                daveSessionGetMarshalledKeyPackage((DAVESessionHandle)m_VoiceConn.m_DaveSession, &kp, &kpLen);
+                if (kp) {
+                    std::vector<uint8_t> msg = {0, 0, 12}; // seq, op 12
+                    msg.insert(msg.end(), kp, kp + kpLen);
+                    WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, msg.data(), (DWORD)msg.size());
+                    daveFree(kp);
+                    DebugLog("[VOICE] Sent DAVE_IDENTIFY (Op 12) with Key Package");
+                }
+            }
+
             if (!m_VoiceConn.m_DaveEncryptor) {
                 m_VoiceConn.m_DaveEncryptor = daveEncryptorCreate();
                 daveEncryptorAssignSsrcToCodec((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor, m_VoiceConn.m_Ssrc, DAVE_CODEC_OPUS);
