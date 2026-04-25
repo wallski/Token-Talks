@@ -925,8 +925,6 @@ bool DiscordClient::JoinVoiceChannel(const std::string &guild_id,
   m_VoiceConn.m_Running = false;
   m_VoiceConn.m_GuildId = guild_id;
   m_VoiceConn.m_ChannelId = channel_id;
-  m_VoiceConn.m_Token.clear();
-  m_VoiceConn.m_Endpoint.clear();
 
   DebugLog("[VOICE-JOIN] Preparing JSON...");
   json d;
@@ -1105,62 +1103,43 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
         DebugLog("[VOICE BIN RX] Op: " + std::to_string(op) + " Seq: " + std::to_string(seq));
 
         if (op == 24) { // DAVE_PREPARE_EPOCH
-          // Payload is epoch (1 byte) + MLS external sender package
           if (payloadLen < 1) continue;
           uint8_t epoch = payload[0];
           DebugLog("[VOICE] DAVE Prepare Epoch: " + std::to_string(epoch));
-          
+          // daveSessionInit should handle this
+        } else if (op == 25) { // DAVE_MLS_EXTERNAL_SENDER
+          if (payloadLen < 1) continue;
+          DebugLog("[VOICE] DAVE MLS External Sender received");
           if (m_VoiceConn.m_DaveSession) {
-            daveSessionSetExternalSender((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload + 1, payloadLen - 1);
-            
-            if (epoch == 1) {
-                uint8_t* kp = nullptr;
-                size_t kpLen = 0;
-                daveSessionGetMarshalledKeyPackage((DAVESessionHandle)m_VoiceConn.m_DaveSession, &kp, &kpLen);
-                if (kp) {
-                    std::vector<uint8_t> msg = {0, 0, 26}; // seq, op 26
-                    msg.insert(msg.end(), kp, kp + kpLen);
-                    WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, msg.data(), (DWORD)msg.size());
-                    daveFree(kp);
-                    DebugLog("[VOICE] Sent MLS Key Package (Op 26)");
-                }
-            }
-
-            // Send Transition Ready (Op 23)
-            unsigned char resp[5] = {0, 0, 23, epoch, 0}; // seq (0,0), op 23, epoch
-            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, resp, 4);
+              daveSessionSetExternalSender((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload, payloadLen);
           }
-        } else if (op == 22) { // DAVE_EXECUTE_TRANSITION
-          if (payloadLen < 1) continue;
-          uint8_t epoch = payload[0];
-          DebugLog("[VOICE] DAVE Execute Transition: " + std::to_string(epoch));
-          // Switch encryptor to new key ratchet if available
-          if (m_VoiceConn.m_DaveSession && m_VoiceConn.m_DaveEncryptor) {
-              void* ratchet = daveSessionGetKeyRatchet((DAVESessionHandle)m_VoiceConn.m_DaveSession, m_UserId.c_str());
-              if (ratchet) {
-                  daveEncryptorSetKeyRatchet((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor, (DAVEKeyRatchetHandle)ratchet);
-                  daveKeyRatchetDestroy((DAVEKeyRatchetHandle)ratchet);
-              }
-          }
-        } else if (op == 25) { // DAVE_PREPARE_TRANSITION
-          if (payloadLen < 1) continue;
-          uint8_t transition_id = payload[0];
-          DebugLog("[VOICE] DAVE Prepare Transition: " + std::to_string(transition_id));
-          
-          // Send Transition Ready (Op 23) as JSON
-          json ready = {{"op", 23}, {"d", {{"transition_id", (int)transition_id}}}};
-          std::string sReady = ready.dump();
-          WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sReady.c_str(), (DWORD)sReady.size());
-          DebugLog("[VOICE] Sent DAVE_TRANSITION_READY (Op 23) for ID: " + std::to_string(transition_id));
+        } else if (op == 26) { // MLS_KEY_PACKAGE (Server ack or broadcast)
+          DebugLog("[VOICE] MLS Key Package received (Op 26)");
+        } else if (op == 27) { // MLS_PROPOSALS
+          DebugLog("[VOICE] MLS Proposals received (Op 27)");
         } else if (op == 28) { // MLS_COMMIT
+          DebugLog("[VOICE] MLS Commit received (Op 28)");
           if (m_VoiceConn.m_DaveSession) {
               void* result = daveSessionProcessCommit((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload, payloadLen);
-              if (result) daveCommitResultDestroy((DAVECommitResultHandle)result);
+              if (result) {
+                  // After successful commit, we might need to send Op 23
+                  uint8_t transition_id = 0; // Need to extract from result or state
+                  // For now, let libdave handle the state
+                  daveCommitResultDestroy((DAVECommitResultHandle)result);
+              }
           }
         } else if (op == 29) { // MLS_WELCOME
+          DebugLog("[VOICE] MLS Welcome received (Op 29)");
           if (m_VoiceConn.m_DaveSession) {
               void* result = daveSessionProcessWelcome((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload, payloadLen, nullptr, 0);
-              if (result) daveWelcomeResultDestroy((DAVEWelcomeResultHandle)result);
+              if (result) {
+                  // After successful welcome, we are in! Send Op 23
+                  uint8_t transition_id = 1; // Default or extracted
+                  json ready = {{"op", 23}, {"d", {{"transition_id", (int)transition_id}}}};
+                  std::string sReady = ready.dump();
+                  WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sReady.c_str(), (DWORD)sReady.size());
+                  daveWelcomeResultDestroy((DAVEWelcomeResultHandle)result);
+              }
           }
         }
         continue;
@@ -1274,17 +1253,17 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
             m_VoiceConn.m_DaveVersion = d["dave_protocol_version"].get<uint16_t>();
             DebugLog("[VOICE] DAVE Protocol Negotiated: v" + std::to_string(m_VoiceConn.m_DaveVersion));
             
-            // NOW we send DAVE_IDENTIFY
+            // Send MLS Key Package (Op 26) instead of Op 12
             if (m_VoiceConn.m_DaveSession) {
                 uint8_t* kp = nullptr;
                 size_t kpLen = 0;
                 daveSessionGetMarshalledKeyPackage((DAVESessionHandle)m_VoiceConn.m_DaveSession, &kp, &kpLen);
                 if (kp) {
-                    std::vector<uint8_t> msg = {0, 0, 12}; // seq, op 12
+                    std::vector<uint8_t> msg = {0, 0, 26}; // seq, op 26
                     msg.insert(msg.end(), kp, kp + kpLen);
                     WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, msg.data(), (DWORD)msg.size());
                     daveFree(kp);
-                    DebugLog("[VOICE] Sent DAVE_IDENTIFY (Op 12) with Key Package");
+                    DebugLog("[VOICE] Sent MLS_KEY_PACKAGE (Op 26)");
                 }
             }
 
