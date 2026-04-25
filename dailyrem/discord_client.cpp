@@ -967,9 +967,9 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                     DebugLog("[VOICE] DAVE Protocol Negotiated: v" + std::to_string(m_VoiceConn.m_DaveVersion));
                     if (m_VoiceConn.m_DaveSession) {
                         uint64_t gId = 0;
-                        try { gId = std::stoull(guildId.empty() ? m_VoiceConn.m_ChannelId : guildId); }
+                        try { gId = std::stoull(m_VoiceConn.m_ChannelId.empty() ? guildId : m_VoiceConn.m_ChannelId); }
                         catch (...) {}
-                        daveSessionInit((DAVESessionHandle)m_VoiceConn.m_DaveSession, m_VoiceConn.m_DaveVersion, gId, m_UserId.c_str());
+                        daveSessionInit((DAVESessionHandle)m_VoiceConn.m_DaveSession, m_VoiceConn.m_DaveVersion, gId, userId.c_str());
                         DebugLog("[VOICE] daveSessionInit called for group: " + std::to_string(gId));
                         uint8_t* kp = nullptr;
                         size_t kpLen = 0;
