@@ -76,6 +76,10 @@ static char g_EditBuffer[1024] = "";
 static std::string g_ActiveVoiceChannelId = "";
 static std::string g_ActiveVoiceChannelName = "";
 static std::string g_ActiveVoiceGuildId = "";
+
+static std::string g_ReplyToId = "";
+static std::string g_ReplyToAuthor = "";
+static std::string g_ReplyToContent = "";
 static bool g_ShowCallView = false;
 static bool g_IsMuted = false;
 static bool g_IsDeafened = false;
@@ -227,7 +231,7 @@ void RequestVideo(const std::string& url) {
         auto bytes = gc.DownloadFile(url);
         if (bytes.empty()) return;
         
-        std::string tempPath = "temp_video.mp4"; // Should use unique name
+        std::string tempPath = "temp_video_" + std::to_string(GetTickCount()) + "_" + std::to_string(rand()) + ".mp4";
         std::ofstream ofs(tempPath, std::ios::binary);
         ofs.write((char*)bytes.data(), bytes.size());
         ofs.close();
@@ -292,7 +296,7 @@ void RequestVideo(const std::string& url) {
             pSample->Release();
         }
         pReader->Release();
-        // DeleteFileA(tempPath.c_str());
+        DeleteFileA(tempPath.c_str());
     }).detach();
 }
 
@@ -355,9 +359,7 @@ void RequestTexture(const std::string& url) {
                     }
                 }
                 stbi_image_free(data);
-                // Free stbi_delays? stb_image documentation says it should be free'd if not null
-                // but usually it's part of the same allocation or similar. 
-                // Actually stbi_load_gif_from_memory allocates it.
+                if (stbi_delays) stbi_image_free(stbi_delays);
             }
         } else {
             unsigned char* data = stbi_load_from_memory(bytes.data(), (int)bytes.size(), &w, &h, &n, 4);
@@ -489,8 +491,7 @@ void RefreshChannels(const std::string& guildId) {
 void RefreshMessages(const std::string& channelId) {
     auto msgs = gc.FetchMessages(channelId);
     std::lock_guard<std::mutex> lock(g_DataMutex);
-    g_SelectedChannelId = channelId;
-    {
+    if (g_SelectedChannelId == channelId) {
         std::lock_guard<std::mutex> chatLock(g_ChatMutex);
         g_Messages = msgs;
     }
@@ -1065,7 +1066,10 @@ void DrawMainApp() {
                     if(tf==2){
                         gc.SetAudioDevices(g_Settings.input_device,g_Settings.output_device);
                         if(gc.JoinVoiceChannel(g_SelectedGuildId,c.id)){g_ActiveVoiceChannelId=c.id;g_ActiveVoiceChannelName=c.name;g_ActiveVoiceGuildId=g_SelectedGuildId;g_ShowCallView=true;}
-                    } else {std::thread([c](){RefreshMessages(c.id);}).detach();}
+                    } else {
+                        { std::lock_guard<std::mutex> lk(g_DataMutex); g_SelectedChannelId = c.id; }
+                        std::thread([c](){RefreshMessages(c.id);}).detach();
+                    }
                 }
                 ImGui::PopStyleColor(3);
                 if(tf==2){
@@ -1096,8 +1100,10 @@ void DrawMainApp() {
                 ImGui::PushStyleColor(ImGuiCol_HeaderHovered,{0.18f,0.20f,0.26f,1.f});
                 ImGui::PushStyleColor(ImGuiCol_HeaderActive,{0.24f,0.26f,0.32f,1.f});
                 ImGui::SetCursorPosX(8);
-                if(ImGui::Selectable(c.name.c_str(),sel,0,{CHAN_W-16,28}))
+                if(ImGui::Selectable(c.name.c_str(),sel,0,{CHAN_W-16,28})){
+                    { std::lock_guard<std::mutex> lk(g_DataMutex); g_SelectedChannelId = c.id; }
                     std::thread([c](){RefreshMessages(c.id);}).detach();
+                }
                 ImGui::PopStyleColor(3);
             }
         } else {
@@ -1187,6 +1193,24 @@ void DrawMainApp() {
                 bool same=(m.author_id==prevAid);prevAid=m.author_id;
                 if(!same){
                     ImGui::Dummy({0,8});
+                    
+                    // Render Reply Reference
+                    if (!m.referenced_message_id.empty()) {
+                        ImGui::SetCursorPosX(LEFT - 20);
+                        ImDrawList* dl2 = ImGui::GetWindowDrawList();
+                        ImVec2 cp2 = ImGui::GetCursorScreenPos();
+                        dl2->AddLine({cp2.x + 5, cp2.y + 10}, {cp2.x + 15, cp2.y + 10}, IM_COL32(88, 101, 242, 255), 2.0f);
+                        dl2->AddLine({cp2.x + 5, cp2.y + 10}, {cp2.x + 5, cp2.y + 25}, IM_COL32(88, 101, 242, 255), 2.0f);
+                        ImGui::SameLine();
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.6f, 1.0f));
+                        ImGui::SetWindowFontScale(0.85f);
+                        std::string refTxt = m.referenced_author + ": " + m.referenced_content;
+                        if (refTxt.size() > 60) refTxt = refTxt.substr(0, 57) + "...";
+                        ImGui::TextUnformatted(refTxt.c_str());
+                        ImGui::SetWindowFontScale(1.0f);
+                        ImGui::PopStyleColor();
+                    }
+
                     ImVec2 avSp=ImGui::GetCursorScreenPos();
                     DrawAvatarCircle(dl,{avSp.x+16.f+AV_R,avSp.y+AV_R},AV_R,m.author_id,m.author_avatar,m.author);
                     ImGui::SetCursorPosX(LEFT);
@@ -1245,10 +1269,28 @@ void DrawMainApp() {
                     }
                     ImGui::NewLine();
                 }
-                if(m.author_id==gc.GetUserId()&&!m.id.empty()){
+                if(!m.id.empty()){
                     if(ImGui::BeginPopupContextItem(("CTX_"+m.id).c_str())){
-                        if(ImGui::MenuItem("Edit")){g_EditingMessageId=m.id;strncpy_s(g_EditBuffer,m.content.c_str(),_TRUNCATE);}
-                        if(ImGui::MenuItem("Delete")){std::string cid=g_SelectedChannelId,mid=m.id;std::thread([cid,mid](){gc.DeleteMessage(cid,mid);RefreshMessages(cid);}).detach();}
+                        if(ImGui::MenuItem("Reply")){
+                            g_ReplyToId = m.id;
+                            g_ReplyToAuthor = m.author;
+                            g_ReplyToContent = m.content;
+                            g_RefocusInput = true;
+                        }
+                        if(ImGui::BeginMenu("React")){
+                            const char* quick_emojis[] = {"👍", "❤️", "😂", "😮", "😢", "🔥"};
+                            for(auto em : quick_emojis) {
+                                if(ImGui::MenuItem(em)) {
+                                    std::string cid=g_SelectedChannelId,mid=m.id,emo=em;
+                                    std::thread([cid,mid,emo](){gc.AddReaction(cid,mid,emo);RefreshMessages(cid);}).detach();
+                                }
+                            }
+                            ImGui::EndMenu();
+                        }
+                        if(m.author_id==gc.GetUserId()){
+                            if(ImGui::MenuItem("Edit")){g_EditingMessageId=m.id;strncpy_s(g_EditBuffer,m.content.c_str(),_TRUNCATE);}
+                            if(ImGui::MenuItem("Delete")){std::string cid=g_SelectedChannelId,mid=m.id;std::thread([cid,mid](){gc.DeleteMessage(cid,mid);RefreshMessages(cid);}).detach();}
+                        }
                         ImGui::EndPopup();
                     }
                 }
@@ -1267,6 +1309,20 @@ void DrawMainApp() {
         ImGui::Dummy({0,4});
         ImGui::SetCursorPosX(8.f);
         
+        // ── REPLY STAGING AREA ──────────────────────────────────────
+        if (!g_ReplyToId.empty()) {
+            ImGui::SetCursorPosX(8.f);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.18f,0.19f,0.22f,1.f));
+            ImGui::BeginChild("ReplyStaging", {ImGui::GetContentRegionAvail().x - 8, 30}, false);
+            ImGui::SetCursorPos({10, 6});
+            ImGui::TextDisabled("Replying to"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 0.6f, 0.9f, 1.0f), "%s", g_ReplyToAuthor.c_str());
+            ImGui::SameLine(ImGui::GetWindowWidth() - 30);
+            if (ImGui::Button("X", {20, 20})) { g_ReplyToId = ""; g_ReplyToAuthor = ""; g_ReplyToContent = ""; }
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+        }
+
         // ── COMPOSE STAGING AREA ─────────────────────────────────────
         if (g_ComposeOpen && !g_ComposeFiles.empty()) {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.16f,0.17f,0.19f,1.f));
@@ -1323,11 +1379,15 @@ void DrawMainApp() {
                 memset(g_InputBuffer,0,sizeof(g_InputBuffer));
                 g_ComposeFiles.clear();
                 g_ComposeOpen = false;
-                std::thread([ch, ct, files, hasText, hasFiles](){
+                std::thread([ch, ct, files, hasText, hasFiles, replyId = g_ReplyToId](){
                     for(const auto& f : files) gc.SendAttachment(ch, f);
-                    if(hasText) gc.SendDiscordMessage(ch, ct);
+                    if(hasText) {
+                        if(!replyId.empty()) gc.SendReply(ch, ct, replyId);
+                        else gc.SendDiscordMessage(ch, ct);
+                    }
                     RefreshMessages(ch);
                 }).detach();
+                g_ReplyToId = ""; g_ReplyToAuthor = ""; g_ReplyToContent = "";
             }
             g_RefocusInput = true; // restore focus next frame
         }

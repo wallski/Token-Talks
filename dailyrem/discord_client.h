@@ -75,6 +75,11 @@ struct VoiceConnection {
     int m_OutputDevice = 0;
     bool m_IsMuted = false;
     bool m_IsDeafened = false;
+
+    // DAVE E2EE
+    void*        m_DaveSession = nullptr;   // DAVESessionHandle
+    void*        m_DaveEncryptor = nullptr; // DAVEEncryptorHandle
+    uint16_t     m_DaveVersion = 0;
 };
 
 struct DiscordMessage {
@@ -88,6 +93,11 @@ struct DiscordMessage {
     std::vector<std::string>     attachment_urls;
     std::vector<std::string>     video_urls;
     std::vector<DiscordReaction> reactions;
+
+    // Reply data
+    std::string referenced_message_id;
+    std::string referenced_author;
+    std::string referenced_content;
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +131,7 @@ public:
     std::vector<DiscordChannel>  FetchPrivateChannels();
     std::vector<DiscordMessage>  FetchMessages(const std::string& channel_id, const std::string& before_id = "");
     bool SendDiscordMessage(const std::string& channel_id, const std::string& content);
+    bool SendReply(const std::string& channel_id, const std::string& content, const std::string& reply_to_id);
     bool EditMessage(const std::string& channel_id, const std::string& msg_id, const std::string& new_content);
     bool DeleteMessage(const std::string& channel_id, const std::string& msg_id);
     bool AddReaction(const std::string& channel_id, const std::string& msg_id, const std::string& emoji);

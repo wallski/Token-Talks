@@ -11,20 +11,24 @@
 #include "gui.h"
 #include "vendor/include/opus.h"
 #include "vendor/include/sodium.h"
+#include "vendor/libdave/include/dave/dave.h"
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "opus.lib")
 #pragma comment(lib, "libsodium.lib")
+#pragma comment(lib, "vendor/libdave/lib/libdave.lib")
 
 using json = nlohmann::json;
 
 #include <fstream>
+#include <mutex>
+static std::mutex g_DebugMutex;
 void DebugLog(const std::string &text) {
+  std::lock_guard<std::mutex> lock(g_DebugMutex);
   std::ofstream f("discord_debug.log", std::ios::app);
   f << text << "\n";
-  std::cout << text
-            << std::endl; // Also print to terminal for real-time debugging
+  std::cout << text << std::endl;
 }
 
 DiscordClient::DiscordClient()
@@ -126,13 +130,13 @@ bool DiscordClient::Connect() {
   if (!resp.empty()) {
     try {
       auto j = json::parse(resp);
-      if (j.contains("id"))
+      if (j.contains("id") && j["id"].is_string())
         m_UserId = j["id"].get<std::string>();
-      if (j.contains("global_name") && !j["global_name"].is_null())
+      if (j.contains("global_name") && !j["global_name"].is_null() && j["global_name"].is_string())
         m_DisplayName = j["global_name"].get<std::string>();
-      else if (j.contains("username"))
+      else if (j.contains("username") && j["username"].is_string())
         m_DisplayName = j["username"].get<std::string>();
-      if (j.contains("avatar") && !j["avatar"].is_null())
+      if (j.contains("avatar") && !j["avatar"].is_null() && j["avatar"].is_string())
         m_AvatarHash = j["avatar"].get<std::string>();
     } catch (...) {
     }
@@ -259,10 +263,11 @@ std::vector<DiscordGuild> DiscordClient::FetchGuilds() {
     auto j = json::parse(resp);
     if (j.is_array()) {
       for (const auto &item : j) {
+        if (!item.contains("id") || !item["id"].is_string()) continue;
         DiscordGuild g;
         g.id = item["id"].get<std::string>();
-        g.name = item["name"].get<std::string>();
-        if (item.contains("icon") && !item["icon"].is_null())
+        g.name = item.value("name", "Unknown Guild");
+        if (item.contains("icon") && !item["icon"].is_null() && item["icon"].is_string())
           g.icon_hash = item["icon"].get<std::string>();
         guilds.push_back(g);
       }
@@ -310,12 +315,14 @@ DiscordClient::FetchChannels(const std::string &guild_id) {
       };
 
       for (const auto &item : j) {
-        if (item["type"].get<int>() == 4) {
-          category_locked[item["id"].get<std::string>()] = isNodeLocked(item);
+        if (item.contains("type") && item["type"].is_number() && item["type"].get<int>() == 4) {
+          if (item.contains("id") && item["id"].is_string())
+            category_locked[item["id"].get<std::string>()] = isNodeLocked(item);
         }
       }
 
       for (const auto &item : j) {
+        if (!item.contains("type") || !item["type"].is_number()) continue;
         int type = item["type"].get<int>();
         if (type == 0 || type == 2) {
           bool locked = isNodeLocked(item);
@@ -327,17 +334,15 @@ DiscordClient::FetchChannels(const std::string &guild_id) {
             }
           }
           DiscordChannel ch;
-          ch.id = item["id"].get<std::string>();
-          ch.name = item["name"].get<std::string>();
+          ch.id = item.value("id", "");
+          ch.name = item.value("name", "unknown-channel");
           ch.type = type;
           ch.is_locked = locked;
-          ch.position =
-              item.contains("position") ? item["position"].get<int>() : 0;
-          ch.parent_id =
-              (item.contains("parent_id") && !item["parent_id"].is_null())
+          ch.position = item.value("position", 0);
+          ch.parent_id = (item.contains("parent_id") && !item["parent_id"].is_null() && item["parent_id"].is_string())
                   ? item["parent_id"].get<std::string>()
                   : "";
-          channels.push_back(ch);
+          if (!ch.id.empty()) channels.push_back(ch);
         }
       }
     }
@@ -417,6 +422,16 @@ DiscordClient::FetchMessages(const std::string &channel_id,
 bool DiscordClient::SendDiscordMessage(const std::string &channel_id,
                                        const std::string &content) {
   json payload = {{"content", content}};
+  std::string resp = HttpRequest(
+      "POST", "/api/v9/channels/" + channel_id + "/messages", payload.dump());
+  return !resp.empty();
+}
+
+bool DiscordClient::SendReply(const std::string &channel_id,
+                                const std::string &content,
+                                const std::string &reply_to_id) {
+  json payload = {{"content", content},
+                  {"message_reference", {{"message_id", reply_to_id}}}};
   std::string resp = HttpRequest(
       "POST", "/api/v9/channels/" + channel_id + "/messages", payload.dump());
   return !resp.empty();
@@ -562,17 +577,19 @@ bool DiscordClient::SendAttachment(const std::string &channel_id,
 }
 
 void DiscordClient::ParseJsonMessage(const json &item, DiscordMessage &dmsg) {
-  dmsg.id = item["id"].get<std::string>();
+  if (item.contains("id") && item["id"].is_string())
+    dmsg.id = item["id"].get<std::string>();
+
   if (item.contains("author") && !item["author"].is_null()) {
     const auto &au = item["author"];
-    if (au.contains("username"))
+    if (au.contains("username") && au["username"].is_string())
       dmsg.author_username = au["username"].get<std::string>();
-    if (au.contains("id"))
+    if (au.contains("id") && au["id"].is_string())
       dmsg.author_id = au["id"].get<std::string>();
-    if (au.contains("avatar") && !au["avatar"].is_null())
+    if (au.contains("avatar") && !au["avatar"].is_null() && au["avatar"].is_string())
       dmsg.author_avatar = au["avatar"].get<std::string>();
     // Prefer global_name (display name) over raw username
-    if (au.contains("global_name") && !au["global_name"].is_null())
+    if (au.contains("global_name") && !au["global_name"].is_null() && au["global_name"].is_string())
       dmsg.author = au["global_name"].get<std::string>();
     else
       dmsg.author = dmsg.author_username;
@@ -625,6 +642,21 @@ void DiscordClient::ParseJsonMessage(const json &item, DiscordMessage &dmsg) {
       dr.count = r.contains("count") ? r["count"].get<int>() : 1;
       dr.me = r.contains("me") ? r["me"].get<bool>() : false;
       dmsg.reactions.push_back(dr);
+    }
+  }
+
+  if (item.contains("referenced_message") && !item["referenced_message"].is_null()) {
+    const auto &ref = item["referenced_message"];
+    if (ref.contains("id") && ref["id"].is_string())
+      dmsg.referenced_message_id = ref["id"].get<std::string>();
+    if (ref.contains("content") && ref["content"].is_string())
+      dmsg.referenced_content = ref["content"].get<std::string>();
+    if (ref.contains("author") && !ref["author"].is_null()) {
+      const auto &rau = ref["author"];
+      if (rau.contains("global_name") && !rau["global_name"].is_null() && rau["global_name"].is_string())
+        dmsg.referenced_author = rau["global_name"].get<std::string>();
+      else if (rau.contains("username") && rau["username"].is_string())
+        dmsg.referenced_author = rau["username"].get<std::string>();
     }
   }
 }
@@ -1028,6 +1060,11 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
              sizeof(timeout));
   m_VoiceConn.m_UdpSocket = udpSocket;
 
+  // Initialize Dave Session
+  m_VoiceConn.m_DaveVersion = daveMaxSupportedProtocolVersion();
+  m_VoiceConn.m_DaveSession = daveSessionCreate(nullptr, nullptr, nullptr, nullptr);
+  DebugLog("[VOICE] Dave Protocol Version: " + std::to_string(m_VoiceConn.m_DaveVersion));
+
   const DWORD cbBuffer = 8192;
   BYTE *pbBuffer = new BYTE[cbBuffer];
 
@@ -1058,6 +1095,74 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
     }
 
     try {
+      if (type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
+        if (wsMessage.size() < 3) continue;
+        uint16_t seq = (uint8_t(wsMessage[0]) << 8) | uint8_t(wsMessage[1]);
+        uint8_t op = uint8_t(wsMessage[2]);
+        const uint8_t* payload = (const uint8_t*)wsMessage.data() + 3;
+        size_t payloadLen = wsMessage.size() - 3;
+
+        DebugLog("[VOICE BIN RX] Op: " + std::to_string(op) + " Seq: " + std::to_string(seq));
+
+        if (op == 24) { // DAVE_PREPARE_EPOCH
+          // Payload is epoch (1 byte) + MLS external sender package
+          if (payloadLen < 1) continue;
+          uint8_t epoch = payload[0];
+          DebugLog("[VOICE] DAVE Prepare Epoch: " + std::to_string(epoch));
+          
+          if (m_VoiceConn.m_DaveSession) {
+            daveSessionSetExternalSender((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload + 1, payloadLen - 1);
+            
+            if (epoch == 1) {
+                uint8_t* kp = nullptr;
+                size_t kpLen = 0;
+                daveSessionGetMarshalledKeyPackage((DAVESessionHandle)m_VoiceConn.m_DaveSession, &kp, &kpLen);
+                if (kp) {
+                    std::vector<uint8_t> msg = {0, 0, 26}; // seq, op 26
+                    msg.insert(msg.end(), kp, kp + kpLen);
+                    WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, msg.data(), (DWORD)msg.size());
+                    daveFree(kp);
+                    DebugLog("[VOICE] Sent MLS Key Package (Op 26)");
+                }
+            }
+
+            // Send Transition Ready (Op 23)
+            unsigned char resp[5] = {0, 0, 23, epoch, 0}; // seq (0,0), op 23, epoch
+            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, resp, 4);
+          }
+        } else if (op == 22) { // DAVE_EXECUTE_TRANSITION
+          if (payloadLen < 1) continue;
+          uint8_t epoch = payload[0];
+          DebugLog("[VOICE] DAVE Execute Transition: " + std::to_string(epoch));
+          // Switch encryptor to new key ratchet if available
+          if (m_VoiceConn.m_DaveSession && m_VoiceConn.m_DaveEncryptor) {
+              void* ratchet = daveSessionGetKeyRatchet((DAVESessionHandle)m_VoiceConn.m_DaveSession, m_UserId.c_str());
+              if (ratchet) {
+                  daveEncryptorSetKeyRatchet((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor, (DAVEKeyRatchetHandle)ratchet);
+                  daveKeyRatchetDestroy((DAVEKeyRatchetHandle)ratchet);
+              }
+          }
+        } else if (op == 25) { // DAVE_PREPARE_TRANSITION
+          if (payloadLen < 1) continue;
+          uint8_t epoch = payload[0];
+          DebugLog("[VOICE] DAVE Prepare Transition: " + std::to_string(epoch));
+          // Send Transition Ready (Op 23)
+          unsigned char resp[4] = {0, 0, 23, epoch}; // seq, op 23, epoch
+          WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, resp, 4);
+        } else if (op == 28) { // MLS_COMMIT
+          if (m_VoiceConn.m_DaveSession) {
+              void* result = daveSessionProcessCommit((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload, payloadLen);
+              if (result) daveCommitResultDestroy((DAVECommitResultHandle)result);
+          }
+        } else if (op == 29) { // MLS_WELCOME
+          if (m_VoiceConn.m_DaveSession) {
+              void* result = daveSessionProcessWelcome((DAVESessionHandle)m_VoiceConn.m_DaveSession, payload, payloadLen, nullptr, 0);
+              if (result) daveWelcomeResultDestroy((DAVEWelcomeResultHandle)result);
+          }
+        }
+        continue;
+      }
+
       DebugLog("[VOICE RX RAW] " + wsMessage);
       auto j = json::parse(wsMessage);
       int op = j["op"];
@@ -1070,6 +1175,26 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
         m_VoiceConn.m_Ssrc = ssrc; // BUG FIX: was never stored
         std::string ip = d["ip"].get<std::string>();
         int port = d["port"].get<int>();
+
+        // Dave Initialization & Identity (Op 12)
+        if (m_VoiceConn.m_DaveSession) {
+            uint64_t gId = 0;
+            try {
+                gId = std::stoull(guildId.empty() ? m_VoiceConn.m_ChannelId : guildId);
+            } catch(...) {}
+            daveSessionInit((DAVESessionHandle)m_VoiceConn.m_DaveSession, m_VoiceConn.m_DaveVersion, gId, m_UserId.c_str());
+            
+            uint8_t* kp = nullptr;
+            size_t kpLen = 0;
+            daveSessionGetMarshalledKeyPackage((DAVESessionHandle)m_VoiceConn.m_DaveSession, &kp, &kpLen);
+            if (kp) {
+                std::vector<uint8_t> msg = {0, 0, 12}; // seq, op 12
+                msg.insert(msg.end(), kp, kp + kpLen);
+                WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, msg.data(), (DWORD)msg.size());
+                daveFree(kp);
+                DebugLog("[VOICE] Sent DAVE_IDENTIFY (Op 12) with Key Package");
+            }
+        }
 
         // BUG FIX: resolve address BEFORE sending any packets
         struct addrinfo hints = {}, *res = nullptr;
@@ -1121,7 +1246,7 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                               {"data",
                                {{"address", myIp},
                                 {"port", (int)myPort},
-                                {"mode", "xsalsa20_poly1305_suffix"}}}}}};
+                                {"mode", "aead_xchacha20_poly1305_rtpsize"}}}}}};
             OutputDebugStringA(
                 "[VOICE] Discovery OK, sending Select Protocol\n");
             std::string sSel = selectP.dump();
@@ -1142,7 +1267,7 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                             {"data",
                              {{"address", ip},
                               {"port", port},
-                              {"mode", "xsalsa20_poly1305_suffix"}}}}}};
+                              {"mode", "aead_xchacha20_poly1305_rtpsize"}}}}}};
           std::string sSel = selectP.dump();
           WinHttpWebSocketSend(hVoiceWS,
                                WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
@@ -1153,6 +1278,17 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
         OutputDebugStringA(
             "[VOICE] Received SESSION_DESCRIPTION (Op 4) - READY!\n");
         m_VoiceConn.m_SecretKey = d["secret_key"].get<std::vector<uint8_t>>();
+        
+        if (d.contains("dave_protocol_version")) {
+            m_VoiceConn.m_DaveVersion = d["dave_protocol_version"].get<uint16_t>();
+            DebugLog("[VOICE] DAVE Protocol Negotiated: v" + std::to_string(m_VoiceConn.m_DaveVersion));
+            
+            if (!m_VoiceConn.m_DaveEncryptor) {
+                m_VoiceConn.m_DaveEncryptor = daveEncryptorCreate();
+                daveEncryptorAssignSsrcToCodec((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor, m_VoiceConn.m_Ssrc, DAVE_CODEC_OPUS);
+            }
+        }
+
         m_VoiceConn.m_Ready = true;
         m_VoiceReady = true;
         std::thread(&DiscordClient::AudioCaptureLoop, this).detach();
@@ -1175,6 +1311,7 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
         d["video"] = false;
         d["streams"] = json::array();
         d["capabilities"] = 32767; // Mask including E2EE support
+        d["max_dave_protocol_version"] = m_VoiceConn.m_DaveVersion;
         identify["d"] = d;
 
         std::string sId = identify.dump();
@@ -1213,6 +1350,16 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
   }
   WinHttpCloseHandle(hConnect);
   WinHttpCloseHandle(hSession);
+  
+  if (m_VoiceConn.m_DaveSession) {
+      daveSessionDestroy((DAVESessionHandle)m_VoiceConn.m_DaveSession);
+      m_VoiceConn.m_DaveSession = nullptr;
+  }
+  if (m_VoiceConn.m_DaveEncryptor) {
+      daveEncryptorDestroy((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor);
+      m_VoiceConn.m_DaveEncryptor = nullptr;
+  }
+
   m_VoiceConn.m_Running = false;
   DebugLog("[VOICE] Loop finished and handles cleaned.");
 }
@@ -1252,29 +1399,35 @@ void DiscordClient::AudioCaptureLoop() {
     *(uint32_t *)(rtp_packet + 8) = htonl(m_VoiceConn.m_Ssrc);
     ts += 960;
 
-    // Nonce for xsalsa20_poly1305_suffix (24 random bytes)
-    unsigned char nonce[24] = {0};
-    for (int i = 0; i < 24; ++i)
-      nonce[i] = rand() % 256;
-
-    // Encrypt (libsodium)
+    // Encrypt
     unsigned char encrypted[512] = {0};
-    unsigned long long encrypted_len = 0;
+    size_t encrypted_len = 0;
+    bool dave_encrypted = false;
 
-    if (m_VoiceConn.m_SecretKey.size() == 32) {
-      crypto_secretbox_easy(encrypted, silent_opus, 3, nonce,
-                            m_VoiceConn.m_SecretKey.data());
-      encrypted_len = 3 + crypto_secretbox_MACBYTES;
+    if (m_VoiceConn.m_DaveEncryptor && daveEncryptorHasKeyRatchet((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor)) {
+        if (daveEncryptorEncrypt((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor, DAVE_MEDIA_TYPE_AUDIO, m_VoiceConn.m_Ssrc, silent_opus, 3, encrypted, 512, &encrypted_len) == DAVE_ENCRYPTOR_RESULT_CODE_SUCCESS) {
+            dave_encrypted = true;
+        }
+    }
 
-      // Append encrypted data to RTP header
-      memcpy(rtp_packet + 12, encrypted, (size_t)encrypted_len);
-      // Append the 24-byte nonce suffix
-      memcpy(rtp_packet + 12 + encrypted_len, nonce, 24);
+    if (dave_encrypted) {
+        // For DAVE, the encrypted frame is placed directly in the RTP payload
+        memcpy(rtp_packet + 12, encrypted, encrypted_len);
+        sendto(m_VoiceConn.m_UdpSocket, (char *)rtp_packet, 12 + (int)encrypted_len, 0,
+               (struct sockaddr *)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
+    } else if (m_VoiceConn.m_SecretKey.size() == 32) {
+        // Fallback to old encryption (likely will be kicked soon)
+        unsigned char nonce[24] = {0};
+        for (int i = 0; i < 24; ++i) nonce[i] = rand() % 256;
 
-      sendto(m_VoiceConn.m_UdpSocket, (char *)rtp_packet,
-             12 + (int)encrypted_len + 24, 0,
-             (struct sockaddr *)&m_VoiceConn.m_ServerAddr,
-             sizeof(m_VoiceConn.m_ServerAddr));
+        crypto_secretbox_easy(encrypted, silent_opus, 3, nonce, m_VoiceConn.m_SecretKey.data());
+        unsigned long long box_len = 3 + crypto_secretbox_MACBYTES;
+
+        memcpy(rtp_packet + 12, encrypted, (size_t)box_len);
+        memcpy(rtp_packet + 12 + box_len, nonce, 24);
+
+        sendto(m_VoiceConn.m_UdpSocket, (char *)rtp_packet, 12 + (int)box_len + 24, 0,
+               (struct sockaddr *)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
     }
   }
   opus_encoder_destroy(encoder);
