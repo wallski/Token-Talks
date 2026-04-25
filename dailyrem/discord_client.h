@@ -50,7 +50,7 @@ struct VoiceMember {
     std::string m_DisplayName; // global_name or server nick
     std::string m_AvatarHash;  // for CDN avatar URL
     std::string m_ChannelId;   // which VC they're in
-    bool m_IsMuted    = false;
+    bool m_IsMuted = false;
     bool m_IsDeafened = false;
     bool m_IsSpeaking = false; // green ring indicator
 };
@@ -62,12 +62,12 @@ struct VoiceConnection {
     std::string m_ChannelId;
     uint32_t    m_Ssrc = 0;
     std::vector<uint8_t> m_SecretKey;
-    bool m_Ready   = false;
+    bool m_Ready = false;
     bool m_Running = false;
 
     // UDP / Voice WebSocket
     SOCKET       m_UdpSocket = INVALID_SOCKET;
-    HINTERNET    m_hVoiceWS  = nullptr;
+    HINTERNET    m_hVoiceWS = nullptr;
     sockaddr_in  m_ServerAddr = {};
     std::thread  m_VoiceThread;
 
@@ -77,9 +77,11 @@ struct VoiceConnection {
     bool m_IsDeafened = false;
 
     // DAVE E2EE
-    void*        m_DaveSession = nullptr;   // DAVESessionHandle
-    void*        m_DaveEncryptor = nullptr; // DAVEEncryptorHandle
+    void* m_DaveSession = nullptr;   // DAVESessionHandle
+    void* m_DaveEncryptor = nullptr; // DAVEEncryptorHandle
     uint16_t     m_DaveVersion = 0;
+    bool         m_DaveHandshakeComplete = false;  // NEW: only true after Op 22
+    std::vector<std::string> m_RecognizedUserIds;  // NEW: tracked from Op 11/13
 };
 
 struct DiscordMessage {
@@ -150,7 +152,7 @@ public:
     void SetVoiceState(bool muted, bool deafened);
     void SetAudioDevices(int inputIdx, int outputIdx);
     void SubscribeToGuild(const std::string& guildId);
-    
+
     // DM Calls
     bool StartCall(const std::string& channel_id);
     bool EndCall(const std::string& channel_id);
@@ -172,13 +174,13 @@ private:
     std::string         m_VoiceSessionId;  // Voice Gateway Session ID
     std::mutex          m_IdMutex;         // Protects session/user IDs
     int                 m_HeartbeatInterval = 41250;
-    int                 m_SequenceNumber    = 0;
+    int                 m_SequenceNumber = 0;
 
     std::atomic<bool>   m_Connected;
     std::atomic<bool>   m_RunHeartbeat;
     std::atomic<bool>   m_VoiceReady;
 
-    void*               m_hWebSocket = nullptr;
+    void* m_hWebSocket = nullptr;
     std::mutex          m_WsMutex;
 
     std::thread         m_WsThread;
