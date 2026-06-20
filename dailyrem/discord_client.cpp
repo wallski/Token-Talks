@@ -9,6 +9,7 @@
 
 #define NOMINMAX
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
+#include <mmsystem.h>   // waveIn/waveOut, WAVEFORMATEX, WAVEHDR, etc.
 #include "gui.h"
 #include "vendor/include/opus.h"
 #include "vendor/include/sodium.h"
@@ -19,6 +20,7 @@
 #pragma comment(lib, "opus.lib")
 #pragma comment(lib, "libsodium.lib")
 #pragma comment(lib, "vendor/libdave/lib/libdave.lib")
+#pragma comment(lib, "winmm.lib")
 
 using json = nlohmann::json;
 
@@ -506,9 +508,9 @@ void DiscordClient::SubscribeToGuild(const std::string& guildId) {
 void DiscordClient::SendIdentify(void* hWebSocket) {
     json identify = { {"op", 2}, {"d", {{"token", m_Token}, {"properties",
         {{"os", "Windows"}, {"browser", "Discord Client"}, {"release_channel", "stable"},
-        {"client_version", "1.0.9150"}, {"os_version", "10.0.19045"}, {"os_arch", "x64"},
-        {"system_locale", "en-US"}, {"client_build_number", 300125},
-        {"native_build_number", 53231}, {"client_event_source", nullptr}}},
+        {"client_version", "1.0.9219"}, {"os_version", "10.0.19045"}, {"os_arch", "x64"},
+        {"system_locale", "en-US"}, {"client_build_number", 362175},
+        {"native_build_number", 59134}, {"client_event_source", nullptr}}},
         {"compress", false}, {"client_state", {{"capabilities", 16383},
         {"highest_last_message_id", "0"}, {"read_state_version", 0},
         {"user_guild_settings_version", -1}, {"user_settings_version", -1}}}}} };
@@ -795,6 +797,8 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
     int timeout = 2000;
     setsockopt(udpSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     m_VoiceConn.m_UdpSocket = udpSocket;
+    m_VoiceConn.m_TxCounter = 0;
+    m_VoiceConn.m_PlaybackThread = std::thread(&DiscordClient::AudioPlaybackLoop, this);
     daveSetLogSinkCallback(DaveLogSink);
     m_VoiceConn.m_DaveVersion = daveMaxSupportedProtocolVersion();
     m_VoiceConn.m_DaveSession = daveSessionCreate(nullptr, nullptr, OnMlsFailure, nullptr);
@@ -821,6 +825,22 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
             DWORD reasonLen = 0;
             WinHttpWebSocketQueryCloseStatus(hVoiceWS, &code, reason, sizeof(reason), &reasonLen);
             DebugLog("[VOICE] Connection closed by server. Code: " + std::to_string(code));
+            if (code == 4005 || code == 4006) {
+                // 4005 = Already Authenticated, 4006 = Session no longer valid.
+                // Do NOT auto-rejoin - clear running flag so GUI knows we're disconnected.
+                DebugLog("[VOICE] " + std::to_string(code) + ": Session invalid - clearing voice state. Please try joining again.");
+                m_VoiceConn.m_Running = false;
+                // Signal gateway to clear our voice state so Discord cleans up
+                json leave = {{"op", 4}, {"d", {
+                    {"guild_id", m_VoiceConn.m_GuildId.empty() ? nullptr : json(m_VoiceConn.m_GuildId)},
+                    {"channel_id", nullptr},
+                    {"self_mute", false},
+                    {"self_deaf", false}
+                }}};
+                QueueWsMessage(leave.dump());
+                // Wait for Discord to fully clear session before allowing reconnect
+                std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+            }
             break;
         }
         try {
@@ -833,96 +853,110 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                 
                 DebugLog("[VOICE BIN RX] Op: " + std::to_string(op) + " Seq: " + std::to_string(seq) + " Len: " + std::to_string(payloadLen));
                 
-                // Op 25: External Sender
-                if (op == 25 && payloadLen < 100) {
-                    DebugLog("[VOICE] DAVE External Sender");
-                    if (m_VoiceConn.m_DaveSession) {
+                // Op 25: External Sender (DAVE MLS external sender credentials)
+                if (op == 25) {
+                    DebugLog("[VOICE] DAVE External Sender received, len=" + std::to_string(payloadLen));
+                    if (m_VoiceConn.m_DaveSession && payloadLen > 0) {
                         daveSessionSetExternalSender(
                             (DAVESessionHandle)m_VoiceConn.m_DaveSession, 
                             payload, payloadLen
                         );
-                        
-                        // Subscribe to join the group
-                        json sub = {{"op", 16}, {"d", {
-                            {"audio_ssrc", m_VoiceConn.m_Ssrc},
-                            {"video_ssrc", 0}, {"rtx_ssrc", 0}
-                        }}};
-                        std::string s = sub.dump();
-                        WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
-                            WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-                            (void*)s.c_str(), (DWORD)s.size());
-                        DebugLog("[VOICE] Sent Subscribe (Op 16)");
+                        DebugLog("[VOICE] daveSessionSetExternalSender OK - pending group created, waiting for Op 27 (Proposals) from server");
+                        // After setExternalSender, libdave has created a pending group.
+                        // The server will now send Op 27 (proposals for us to commit) or Op 30 (welcome into existing group).
+                        // We must NOT call processProposals yet - wait for the server's Op 27 payload.
                     }
                 }
+
                 
-                // Op 30: MLS Welcome (joining existing call)
+                // Op 30: MLS Welcome (joining existing call - we are a new joiner)
                 else if (op == 30) {
-                    DebugLog("[VOICE] MLS Welcome (Op 30), len=" + std::to_string(payloadLen));
-                    
-                    if (m_VoiceConn.m_DaveSession && payloadLen > 0) {
-                        std::vector<const char*> users;
-                        for (auto& u : m_VoiceConn.m_RecognizedUserIds) 
-                            users.push_back(u.c_str());
+                    // Op 30 format: [2-byte transition_id][welcome_bytes...]
+                    if (payloadLen < 2) {
+                        DebugLog("[VOICE] Op 30 too short: " + std::to_string(payloadLen));
+                    } else {
+                        uint16_t tid = (payload[0] << 8) | payload[1];
+                        DebugLog("[VOICE] MLS Welcome (Op 30), transition=" + std::to_string(tid) + " len=" + std::to_string(payloadLen - 2));
                         
-                        void* result = daveSessionProcessWelcome(
-                            (DAVESessionHandle)m_VoiceConn.m_DaveSession,
-                            payload, payloadLen, users.data(), users.size()
-                        );
-                        
-                        if (result) {
-                            DebugLog("[VOICE] Welcome processed! Sending Op 23");
+                        if (m_VoiceConn.m_DaveSession && payloadLen > 2) {
+                            std::vector<const char*> users;
+                            for (auto& u : m_VoiceConn.m_RecognizedUserIds) 
+                                users.push_back(u.c_str());
                             
-                            // Send Transition Ready
-                            uint8_t ready[4] = {0, 0, 23, 1};
-                            WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
-                                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                                ready, 4);
+                            void* result = daveSessionProcessWelcome(
+                                (DAVESessionHandle)m_VoiceConn.m_DaveSession,
+                                payload + 2, payloadLen - 2, users.data(), users.size()
+                            );
                             
-                            // Set encryption keys
-                            if (m_VoiceConn.m_DaveEncryptor) {
-                                void* kr = daveSessionGetKeyRatchet(
-                                    (DAVESessionHandle)m_VoiceConn.m_DaveSession,
-                                    userId.c_str()
-                                );
-                                if (kr) {
-                                    daveEncryptorSetKeyRatchet(
-                                        (DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor,
-                                        (DAVEKeyRatchetHandle)kr
-                                    );
-                                    daveKeyRatchetDestroy((DAVEKeyRatchetHandle)kr);
-                                    DebugLog("[VOICE] Encryption keys set!");
-                                }
+                            if (result) {
+                                DebugLog("[VOICE] Welcome processed! Sending Transition Ready (Op 23), tid=" + std::to_string(tid));
+                                
+                                // Send Transition Ready with server's transition ID as JSON
+                                json jReady = { {"op", 23}, {"d", {{"transition_id", tid}}} };
+                                std::string sReady = jReady.dump();
+                                { std::lock_guard<std::mutex> lkSend(m_VoiceConn.m_VoiceWsSendMutex);
+                                  WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
+                                    WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sReady.c_str(), (DWORD)sReady.size()); }
+                                DebugLog("[VOICE] Sent Transition Ready (Op 23) tid=" + std::to_string(tid) + " as JSON");
+                                
+                                UpdateDaveKeys();
+                                daveWelcomeResultDestroy((DAVEWelcomeResultHandle)result);
+                            } else {
+                                DebugLog("[VOICE] Welcome processing FAILED");
                             }
-                            daveWelcomeResultDestroy((DAVEWelcomeResultHandle)result);
                         }
                     }
                 }
                 
-                // Op 27: Proposals (when YOU are coordinator)
+                // Op 27: Proposals (server sends add-proposals to the coordinator)
+                // Format: [2-byte transition_id][proposals_bytes...]
                 else if (op == 27) {
-                    DebugLog("[VOICE] Proposals (Op 27), len=" + std::to_string(payloadLen));
-                    
-                    if (m_VoiceConn.m_DaveSession && payloadLen > 0) {
-                        std::vector<const char*> users;
-                        for (auto& u : m_VoiceConn.m_RecognizedUserIds)
-                            users.push_back(u.c_str());
+                    if (payloadLen < 2) {
+                        DebugLog("[VOICE] Op 27 too short: " + std::to_string(payloadLen));
+                    } else {
+                        uint16_t tid = (payload[0] << 8) | payload[1];
+                        const uint8_t* proposalData = payload + 2;
+                        size_t proposalLen = payloadLen - 2;
                         
-                        uint8_t* cw = nullptr;
-                        size_t cwLen = 0;
-                        daveSessionProcessProposals(
-                            (DAVESessionHandle)m_VoiceConn.m_DaveSession,
-                            payload, payloadLen, users.data(), users.size(),
-                            &cw, &cwLen
-                        );
+                        std::string hexDump;
+                        size_t dumpLen = (payloadLen < 48) ? payloadLen : 48;
+                        char hbuf[4];
+                        for (size_t i = 0; i < dumpLen; i++) {
+                            snprintf(hbuf, sizeof(hbuf), "%02x", payload[i]);
+                            hexDump += hbuf;
+                        }
+                        DebugLog("[VOICE] Proposals (Op 27) tid=" + std::to_string(tid) + " proposalLen=" + std::to_string(proposalLen) + " hex=" + hexDump);
                         
-                        if (cw && cwLen > 0) {
-                            std::vector<uint8_t> msg = {0, 0, 28};
-                            msg.insert(msg.end(), cw, cw + cwLen);
-                            WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
-                                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                                msg.data(), (DWORD)msg.size());
-                            DebugLog("[VOICE] Sent Commit/Welcome (Op 28)");
-                            daveFree(cw);
+                        if (m_VoiceConn.m_DaveSession && proposalLen > 0) {
+                            std::vector<const char*> users;
+                            for (auto& u : m_VoiceConn.m_RecognizedUserIds)
+                                users.push_back(u.c_str());
+                            
+                            uint8_t* cw = nullptr;
+                            size_t cwLen = 0;
+                            daveSessionProcessProposals(
+                                (DAVESessionHandle)m_VoiceConn.m_DaveSession,
+                                proposalData, proposalLen, users.data(), users.size(),
+                                &cw, &cwLen
+                            );
+                            
+                            if (cw && cwLen > 0) {
+                                // Op 28: [op=28][tid_hi][tid_lo][commit+welcome_bytes]
+                                std::vector<uint8_t> msg = { 28, (uint8_t)(tid >> 8), (uint8_t)(tid & 0xFF) };
+                                msg.insert(msg.end(), cw, cw + cwLen);
+                                { std::lock_guard<std::mutex> lkSend(m_VoiceConn.m_VoiceWsSendMutex);
+                                  WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
+                                    WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                                    msg.data(), (DWORD)msg.size()); }
+                                DebugLog("[VOICE] Sent Commit/Welcome (Op 28) tid=" + std::to_string(tid) + " bytes=" + std::to_string(cwLen));
+                                daveFree(cw);
+                                
+                                UpdateDaveKeys();
+                            } else {
+                                DebugLog("[VOICE] WARNING: processProposals returned no commit for Op 27!");
+                            }
+                        } else if (proposalLen == 0) {
+                            DebugLog("[VOICE] Op 27 has empty proposal bytes after tid");
                         }
                     }
                 }
@@ -938,11 +972,15 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                             payload + 2, payloadLen - 2
                         );
                         if (result) {
-                            uint8_t ready[4] = {0, 0, 23, (uint8_t)tid};
-                            WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
-                                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                                ready, 4);
-                            DebugLog("[VOICE] Sent Op 23 for transition " + std::to_string(tid));
+                            json jReady = { {"op", 23}, {"d", {{"transition_id", tid}}} };
+                            std::string sReady = jReady.dump();
+                            { std::lock_guard<std::mutex> lkSend(m_VoiceConn.m_VoiceWsSendMutex);
+                              WinHttpWebSocketSend((HINTERNET)m_VoiceConn.m_hVoiceWS,
+                                WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sReady.c_str(), (DWORD)sReady.size()); }
+                            DebugLog("[VOICE] Sent Op 23 for transition " + std::to_string(tid) + " as JSON");
+                            
+                            UpdateDaveKeys();
+                            
                             daveCommitResultDestroy((DAVECommitResultHandle)result);
                         }
                     }
@@ -959,12 +997,28 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                     std::thread(&DiscordClient::AudioCaptureLoop, this).detach();
                 }
                 
+                // Log any unhandled binary opcode so we never miss server messages
+                else {
+                    // Hex-dump first 32 bytes for inspection
+                    std::string hexDump;
+                    size_t dumpLen = (payloadLen < 32) ? payloadLen : 32;
+                    char buf[4];
+                    for (size_t i = 0; i < dumpLen; i++) {
+                        snprintf(buf, sizeof(buf), "%02x", payload[i]);
+                        hexDump += buf;
+                    }
+                    DebugLog("[VOICE BIN UNKNOWN] Op=" + std::to_string(op) + " Seq=" + std::to_string(seq) + " Len=" + std::to_string(payloadLen) + " Data=" + hexDump);
+                }
+                
                 continue;
             }
             DebugLog("[VOICE RX RAW] " + wsMessage);
             auto j = json::parse(wsMessage);
             int op = j["op"];
             auto d = j["d"];
+            if (j.contains("seq") && !j["seq"].is_null()) {
+                m_VoiceConn.m_VoiceSeqAck = j["seq"].get<int>();
+            }
             if (op == 2) {
                 DebugLog("[VOICE] AUTHENTICATION SUCCESS! Received READY (Op 2)");
                 OutputDebugStringA("[VOICE] Received READY (Op 2)\n");
@@ -984,49 +1038,90 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                     m_VoiceConn.m_ServerAddr.sin_port = htons((u_short)port);
                     inet_pton(AF_INET, ip.c_str(), &m_VoiceConn.m_ServerAddr.sin_addr);
                 }
-                unsigned char packet[74] = { 0 };
-                *(uint16_t*)(packet) = htons(1);
-                *(uint16_t*)(packet + 2) = htons(70);
-                *(uint32_t*)(packet + 4) = htonl(ssrc);
-                bool discovered = false;
-                for (int retry = 0; retry < 5 && !discovered; ++retry) {
-                    sendto(udpSocket, (char*)packet, 74, 0, (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
-                    struct sockaddr_in from;
-                    int fromLen = sizeof(from);
-                    char resp2[74] = { 0 };
-                    int r = recvfrom(udpSocket, resp2, 74, 0, (struct sockaddr*)&from, &fromLen);
-                    if (r > 0) {
-                        discovered = true;
-                        char szIp[64] = { 0 };
-                        for (int k = 0; k < 63; k++) {
-                            char c = resp2[8 + k];
-                            if (c == 0) break;
-                            szIp[k] = c;
+
+                // Perform UDP IP-discovery synchronously on this thread.
+                // Discord validates the address in Op 1 (Select Protocol) and rejects
+                // its own server IP — we MUST send our real external IP/port.
+                // Max wait: 3 x 100ms = 300ms, well within any server timeout.
+                std::string myIp = ip;   // fallback: server IP
+                int myPort = port;
+                {
+                    int disc_timeout = 100;
+                    setsockopt(m_VoiceConn.m_UdpSocket, SOL_SOCKET, SO_RCVTIMEO,
+                        (char*)&disc_timeout, sizeof(disc_timeout));
+
+                    unsigned char disc_pkt[74] = { 0 };
+                    *(uint16_t*)(disc_pkt)     = htons(1);
+                    *(uint16_t*)(disc_pkt + 2) = htons(70);
+                    *(uint32_t*)(disc_pkt + 4) = htonl(ssrc);
+
+                    for (int retry = 0; retry < 3; ++retry) {
+                        sendto(m_VoiceConn.m_UdpSocket, (char*)disc_pkt, 74, 0,
+                            (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
+                        char resp[74] = { 0 };
+                        struct sockaddr_in from{};
+                        int fromLen = sizeof(from);
+                        if (recvfrom(m_VoiceConn.m_UdpSocket, resp, 74, 0,
+                            (struct sockaddr*)&from, &fromLen) > 0) {
+                            char szIp[64] = { 0 };
+                            for (int k = 0; k < 63 && resp[8 + k]; k++) szIp[k] = resp[8 + k];
+                            myIp   = szIp;
+                            myPort = (int)ntohs(*(uint16_t*)(resp + 72));
+                            DebugLog("[VOICE] UDP Discovery OK: external ip=" + myIp + " port=" + std::to_string(myPort));
+                            break;
                         }
-                        std::string myIp = szIp;
-                        uint16_t myPort = ntohs(*(uint16_t*)(resp2 + 72));
-                        json selectP = { {"op", 1}, {"d", {{"protocol", "udp"}, {"data",
-                            {{"address", myIp}, {"port", (int)myPort}, {"mode", "aead_xchacha20_poly1305_rtpsize"}}}}} };
-                        OutputDebugStringA("[VOICE] Discovery OK, sending Select Protocol\n");
-                        std::string sSel = selectP.dump();
-                        WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sSel.c_str(), (DWORD)sSel.size());
                     }
-                    else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    }
+                    if (myIp == ip)
+                        DebugLog("[VOICE] UDP Discovery failed after 300ms, falling back to server ip=" + ip);
+
+                    // Restore socket timeout for UdpReceiveLoop (started later on Op 4)
+                    int normal_timeout = 2000;
+                    setsockopt(m_VoiceConn.m_UdpSocket, SOL_SOCKET, SO_RCVTIMEO,
+                        (char*)&normal_timeout, sizeof(normal_timeout));
                 }
-                if (!discovered) {
-                    OutputDebugStringA("[VOICE] Discovery failed, sending fallback Select Protocol\n");
+
+                // Send Select Protocol (Op 1) with our real external IP/port
+                {
                     json selectP = { {"op", 1}, {"d", {{"protocol", "udp"}, {"data",
-                        {{"address", ip}, {"port", port}, {"mode", "aead_xchacha20_poly1305_rtpsize"}}}}} };
+                        {{"address", myIp}, {"port", myPort}, {"mode", "aead_xchacha20_poly1305_rtpsize"}}}}} };
                     std::string sSel = selectP.dump();
-                    WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sSel.c_str(), (DWORD)sSel.size());
+                    DebugLog("[VOICE] Sending Select Protocol (Op 1): ip=" + myIp + " port=" + std::to_string(myPort));
+                    { std::lock_guard<std::mutex> lkSend(m_VoiceConn.m_VoiceWsSendMutex);
+                      WinHttpWebSocketSend((HINTERNET)hVoiceWS,
+                          WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                          (void*)sSel.c_str(), (DWORD)sSel.size()); }
                 }
             }
+
             else if (op == 4) {
                 DebugLog("[VOICE] Received SESSION_DESCRIPTION (Op 4) - READY!");
                 OutputDebugStringA("[VOICE] Received SESSION_DESCRIPTION (Op 4) - READY!\n");
                 m_VoiceConn.m_SecretKey = d["secret_key"].get<std::vector<uint8_t>>();
+
+                if (m_VoiceConn.m_Running && !m_VoiceConn.m_UdpReceiveThread.joinable()) {
+                    DebugLog("[VOICE] Starting UdpReceiveLoop thread now that Session Description (Op 4) is received.");
+                    m_VoiceConn.m_UdpReceiveThread = std::thread(&DiscordClient::UdpReceiveLoop, this);
+                    
+                    // Start correct UDP keepalive thread
+                    uint32_t currentSsrc = m_VoiceConn.m_Ssrc;
+                    std::thread([this, currentSsrc]() {
+                        DebugLog("[UDP] Keepalive thread started (74-byte format)");
+                        unsigned char disc_pkt[74] = { 0 };
+                        *(uint16_t*)(disc_pkt)     = htons(1);
+                        *(uint16_t*)(disc_pkt + 2) = htons(70);
+                        *(uint32_t*)(disc_pkt + 4) = htonl(currentSsrc);
+                        while (m_VoiceConn.m_Running) {
+                            sendto(m_VoiceConn.m_UdpSocket, (char*)disc_pkt, 74, 0,
+                                (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
+                            for (int i = 0; i < 20 && m_VoiceConn.m_Running; ++i) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            }
+                        }
+                        DebugLog("[UDP] Keepalive thread ended");
+                    }).detach();
+                    
+                }
+
                 if (d.contains("dave_protocol_version")) {
                     m_VoiceConn.m_DaveVersion = d["dave_protocol_version"].get<uint16_t>();
                     DebugLog("[VOICE] DAVE Protocol Negotiated: v" + std::to_string(m_VoiceConn.m_DaveVersion));
@@ -1034,6 +1129,17 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                         uint64_t gId = 0;
                         try { gId = std::stoull(m_VoiceConn.m_ChannelId.empty() ? guildId : m_VoiceConn.m_ChannelId); }
                         catch (...) {}
+                        
+                        unsigned long long parsedUserId = 0;
+                        try { parsedUserId = std::stoull(userId); }
+                        catch (const std::exception& e) {
+                            DebugLog("[VOICE] userId std::stoull threw exception: " + std::string(e.what()));
+                        }
+                        char hexBuf[32];
+                        sprintf_s(hexBuf, "0x%llX", parsedUserId);
+                        DebugLog("[VOICE] daveSessionInit: userId='" + userId + "' len=" + std::to_string(userId.length()) + 
+                                 " parsed_uint64=" + std::to_string(parsedUserId) + " hex=" + std::string(hexBuf));
+
                         daveSessionInit((DAVESessionHandle)m_VoiceConn.m_DaveSession, m_VoiceConn.m_DaveVersion, gId, userId.c_str());
                         DebugLog("[VOICE] daveSessionInit called for group: " + std::to_string(gId));
                         uint8_t* kp = nullptr;
@@ -1041,9 +1147,10 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                         daveSessionGetMarshalledKeyPackage((DAVESessionHandle)m_VoiceConn.m_DaveSession, &kp, &kpLen);
                         DebugLog("[VOICE] KeyPackage: ptr=" + std::to_string((uintptr_t)kp) + " len=" + std::to_string(kpLen));
                         if (kp && kpLen > 0) {
-                            std::vector<uint8_t> msg = { 0, 0, 26 };
+                            std::vector<uint8_t> msg = { 26 };
                             msg.insert(msg.end(), kp, kp + kpLen);
-                            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, msg.data(), (DWORD)msg.size());
+                            { std::lock_guard<std::mutex> lkSend(m_VoiceConn.m_VoiceWsSendMutex);
+                              WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, msg.data(), (DWORD)msg.size()); }
                             daveFree(kp);
                             DebugLog("[VOICE] Sent MLS_KEY_PACKAGE (Op 26), bytes=" + std::to_string(msg.size()));
                         }
@@ -1056,6 +1163,13 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                         daveEncryptorAssignSsrcToCodec((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor, m_VoiceConn.m_Ssrc, DAVE_CODEC_OPUS);
                     }
                     m_VoiceConn.m_Ready = true;
+                    
+                    // Send Op 5 (Speaking) to let the server know we are ready
+                    json speaking = { {"op", 5}, {"d", {{"speaking", 1}, {"delay", 0}, {"ssrc", m_VoiceConn.m_Ssrc}}} };
+                    std::string sSp = speaking.dump();
+                    { std::lock_guard<std::mutex> lkSend(m_VoiceConn.m_VoiceWsSendMutex);
+                      WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sSp.c_str(), (DWORD)sSp.size()); }
+                    DebugLog("[VOICE] Sent Op 5 (Speaking)");
                 }
                 else {
                     m_VoiceConn.m_Ready = true;
@@ -1076,20 +1190,45 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                 id["token"] = token;
                 id["video"] = false;
                 id["streams"] = json::array();
-                id["capabilities"] = 32767;
+                // Real Discord desktop client sends capabilities=7 for voice identify
+                // (bits: 1=PRIORITY_SPEAKER, 2=SYNC_SSRCS, 4=CONTEXT_AUDIO)
+                id["capabilities"] = 7;
                 id["max_dave_protocol_version"] = m_VoiceConn.m_DaveVersion;
                 identify["d"] = id;
                 std::string sId = identify.dump();
                 DebugLog("[VOICE] Sending Identify: " + sId);
-                WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sId.c_str(), (DWORD)sId.size());
+                { std::lock_guard<std::mutex> lkSend(m_VoiceConn.m_VoiceWsSendMutex);
+                  WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sId.c_str(), (DWORD)sId.size()); }
                 std::thread([this, hVoiceWS, interval]() {
+                    // First heartbeat at interval/2 (~6875ms): avoids the ~10s server-side
+                    // timeout while not sending before the handshake is underway.
+                    // Subsequent beats follow the normal interval.
+                    int firstBeat = interval / 2;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(firstBeat));
+                    if (!m_VoiceConn.m_Running || m_VoiceConn.m_hVoiceWS != hVoiceWS) return;
+                    
                     while (m_VoiceConn.m_Running && m_VoiceConn.m_hVoiceWS == hVoiceWS) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(interval));
-                        json hb = { {"op", 3}, {"d", GetTickCount()} };
+                        uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        json hb = { {"op", 3}, {"d", { {"t", now_ms}, {"seq_ack", m_VoiceConn.m_VoiceSeqAck} }} };
                         std::string sHb = hb.dump();
-                        WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sHb.c_str(), (DWORD)sHb.size());
+                        {
+                            std::lock_guard<std::mutex> lkSend(m_VoiceConn.m_VoiceWsSendMutex);
+                            WinHttpWebSocketSend(hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sHb.c_str(), (DWORD)sHb.size());
+                        }
+                        DebugLog("[VOICE] Sent voice heartbeat.");
+                        for (int i = 0; i < interval / 100 && m_VoiceConn.m_Running && m_VoiceConn.m_hVoiceWS == hVoiceWS; ++i)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     }
                     }).detach();
+            }
+            else if (op == 5) {
+                if (d.contains("user_id") && d["user_id"].is_string() && d.contains("ssrc") && d["ssrc"].is_number()) {
+                    std::string uid = d["user_id"].get<std::string>();
+                    uint32_t ssrc = d["ssrc"].get<uint32_t>();
+                    std::lock_guard<std::mutex> lock(m_VoiceConn.m_VoiceDataMutex);
+                    m_VoiceConn.m_SsrcToUser[ssrc] = uid;
+                    DebugLog("[VOICE] Mapped SSRC " + std::to_string(ssrc) + " to User " + uid);
+                }
             }
             else if (op == 11) {
                 if (j["d"].contains("user_ids")) {
@@ -1108,6 +1247,14 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
                     auto& v = m_VoiceConn.m_RecognizedUserIds;
                     v.erase(std::remove(v.begin(), v.end(), uid), v.end());
                     DebugLog("[VOICE] Client Disconnect: " + uid);
+                    
+                    std::lock_guard<std::mutex> lock(m_VoiceConn.m_VoiceDataMutex);
+                    auto it = m_VoiceConn.m_UserDecryptors.find(uid);
+                    if (it != m_VoiceConn.m_UserDecryptors.end()) {
+                        daveDecryptorDestroy((DAVEDecryptorHandle)it->second);
+                        m_VoiceConn.m_UserDecryptors.erase(it);
+                        DebugLog("[DAVE] Destroyed decryptor for disconnected user: " + uid);
+                    }
                 }
             }
             
@@ -1136,58 +1283,488 @@ void DiscordClient::VoiceLoop(std::string endpoint, std::string token,
         daveEncryptorDestroy((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor);
         m_VoiceConn.m_DaveEncryptor = nullptr;
     }
+    {
+        std::lock_guard<std::mutex> lock(m_VoiceConn.m_VoiceDataMutex);
+        for (auto& pair : m_VoiceConn.m_UserDecryptors) {
+            if (pair.second) {
+                daveDecryptorDestroy((DAVEDecryptorHandle)pair.second);
+            }
+        }
+        m_VoiceConn.m_UserDecryptors.clear();
+        for (auto& pair : m_VoiceConn.m_OpusDecoders) {
+            if (pair.second) {
+                opus_decoder_destroy((OpusDecoder*)pair.second);
+            }
+        }
+        m_VoiceConn.m_OpusDecoders.clear();
+        m_VoiceConn.m_SsrcToUser.clear();
+        m_VoiceConn.m_UserPcmQueues.clear();
+    }
     m_VoiceConn.m_Running = false;
+    if (m_VoiceConn.m_UdpReceiveThread.joinable()) {
+        m_VoiceConn.m_UdpReceiveThread.join();
+    }
+    if (m_VoiceConn.m_PlaybackThread.joinable()) {
+        m_VoiceConn.m_PlaybackThread.join();
+    }
     DebugLog("[VOICE] Loop finished and handles cleaned.");
 }
 
 void DiscordClient::AudioCaptureLoop() {
-    json speaking = { {"op", 5}, {"d", {{"speaking", 1}, {"delay", 0}, {"ssrc", m_VoiceConn.m_Ssrc}}} };
-    std::string sSp = speaking.dump();
-    if (m_VoiceConn.m_hVoiceWS)
-        WinHttpWebSocketSend(m_VoiceConn.m_hVoiceWS, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)sSp.c_str(), (DWORD)sSp.size());
     int samples = 48000;
     int channels = 1;
     OpusEncoder* encoder = opus_encoder_create(samples, channels, OPUS_APPLICATION_VOIP, nullptr);
     opus_encoder_ctl(encoder, OPUS_SET_BITRATE(64000));
     uint16_t seq = 0;
     uint32_t ts = 0;
-    unsigned char rtp_packet[1024];
-    unsigned char silent_opus[3] = { 0xF8, 0xFF, 0xFE };
+    unsigned char rtp_packet[2048];
+    
+    // waveIn setup
+    HANDLE hCaptureEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    HWAVEIN hWaveIn = nullptr;
+    WAVEFORMATEX wfx = {};
+    wfx.wFormatTag = WAVE_FORMAT_PCM;
+    wfx.nChannels = 1;
+    wfx.nSamplesPerSec = 48000;
+    wfx.wBitsPerSample = 16;
+    wfx.nBlockAlign = 2;
+    wfx.nAvgBytesPerSec = 96000;
+    
+    UINT inputDeviceIdx = (UINT)m_VoiceConn.m_InputDevice;
+    if (waveInOpen(&hWaveIn, inputDeviceIdx, &wfx, (DWORD_PTR)hCaptureEvent, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR) {
+        // Fallback to WAVE_MAPPER
+        waveInOpen(&hWaveIn, WAVE_MAPPER, &wfx, (DWORD_PTR)hCaptureEvent, 0, CALLBACK_EVENT);
+    }
+    
+    const int NUM_CAPTURE_BUFFERS = 4;
+    const int CAPTURE_BUFFER_SIZE = 1920; // 20ms of 48kHz 16-bit Mono = 960 samples * 2 bytes
+    std::vector<WAVEHDR> headers(NUM_CAPTURE_BUFFERS);
+    std::vector<std::vector<char>> buffers(NUM_CAPTURE_BUFFERS, std::vector<char>(CAPTURE_BUFFER_SIZE));
+    
+    bool waveInStarted = false;
+    if (hWaveIn) {
+        for (int i = 0; i < NUM_CAPTURE_BUFFERS; ++i) {
+            headers[i].lpData = buffers[i].data();
+            headers[i].dwBufferLength = CAPTURE_BUFFER_SIZE;
+            waveInPrepareHeader(hWaveIn, &headers[i], sizeof(WAVEHDR));
+            waveInAddBuffer(hWaveIn, &headers[i], sizeof(WAVEHDR));
+        }
+        waveInStart(hWaveIn);
+        waveInStarted = true;
+        DebugLog("[VOICE] waveIn started successfully.");
+    } else {
+        DebugLog("[VOICE] waveIn failed to initialize, falling back to silent frames.");
+    }
+    
     while (m_VoiceConn.m_Running && m_VoiceReady) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        short pcm_in[960] = {0};
+        bool gotInput = false;
+        
+        if (waveInStarted && hWaveIn) {
+            DWORD waitRes = WaitForSingleObject(hCaptureEvent, 100);
+            if (waitRes == WAIT_OBJECT_0) {
+                for (int i = 0; i < NUM_CAPTURE_BUFFERS; ++i) {
+                    if (headers[i].dwFlags & WHDR_DONE) {
+                        waveInUnprepareHeader(hWaveIn, &headers[i], sizeof(WAVEHDR));
+                        
+                        // Copy data
+                        memcpy(pcm_in, headers[i].lpData, CAPTURE_BUFFER_SIZE);
+                        gotInput = true;
+                        
+                        // Re-queue
+                        waveInPrepareHeader(hWaveIn, &headers[i], sizeof(WAVEHDR));
+                        waveInAddBuffer(hWaveIn, &headers[i], sizeof(WAVEHDR));
+                    }
+                }
+            }
+        }
+        
+        if (!gotInput) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        
         if (m_VoiceConn.m_IsMuted) continue;
+        
+        // Encode Opus
+        unsigned char opus_data[1024];
+        int opus_len = opus_encode(encoder, pcm_in, 960, opus_data, sizeof(opus_data));
+        if (opus_len <= 0) continue;
+        
+        // Construct RTP packet
         rtp_packet[0] = 0x80;
         rtp_packet[1] = 0x78;
         *(uint16_t*)(rtp_packet + 2) = htons(seq++);
         *(uint32_t*)(rtp_packet + 4) = htonl(ts);
         *(uint32_t*)(rtp_packet + 8) = htonl(m_VoiceConn.m_Ssrc);
         ts += 960;
-        unsigned char encrypted[512] = { 0 };
-        size_t encrypted_len = 0;
-        bool dave_encrypted = false;
+        
+        // 1. DAVE E2EE Layer
+        unsigned char dave_encrypted_buf[1024] = {0};
+        size_t dave_encrypted_len = 0;
+        bool dave_ok = false;
         if (m_VoiceConn.m_DaveEncryptor && daveEncryptorHasKeyRatchet((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor)) {
             if (daveEncryptorEncrypt((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor, DAVE_MEDIA_TYPE_AUDIO, m_VoiceConn.m_Ssrc,
-                silent_opus, 3, encrypted, 512, &encrypted_len) == DAVE_ENCRYPTOR_RESULT_CODE_SUCCESS) {
-                dave_encrypted = true;
+                opus_data, opus_len, dave_encrypted_buf, sizeof(dave_encrypted_buf), &dave_encrypted_len) == DAVE_ENCRYPTOR_RESULT_CODE_SUCCESS) {
+                dave_ok = true;
             }
         }
-        if (dave_encrypted) {
-            memcpy(rtp_packet + 12, encrypted, encrypted_len);
-            sendto(m_VoiceConn.m_UdpSocket, (char*)rtp_packet, 12 + (int)encrypted_len, 0,
-                (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
-        }
-        else if (m_VoiceConn.m_SecretKey.size() == 32) {
-            unsigned char nonce[24] = { 0 };
-            for (int i = 0; i < 24; ++i) nonce[i] = rand() % 256;
-            crypto_secretbox_easy(encrypted, silent_opus, 3, nonce, m_VoiceConn.m_SecretKey.data());
-            unsigned long long box_len = 3 + crypto_secretbox_MACBYTES;
-            memcpy(rtp_packet + 12, encrypted, (size_t)box_len);
-            memcpy(rtp_packet + 12 + box_len, nonce, 24);
-            sendto(m_VoiceConn.m_UdpSocket, (char*)rtp_packet, 12 + (int)box_len + 24, 0,
+        
+        const uint8_t* payload_ptr = dave_ok ? dave_encrypted_buf : opus_data;
+        size_t payload_len = dave_ok ? dave_encrypted_len : (size_t)opus_len;
+        
+        // 2. Transport AEAD Layer (aead_xchacha20_poly1305_rtpsize)
+        if (m_VoiceConn.m_SecretKey.size() == 32) {
+            unsigned char nonce[24] = {0};
+            uint32_t current_counter = m_VoiceConn.m_TxCounter++;
+            uint32_t network_counter = htonl(current_counter);
+            *(uint32_t*)nonce = network_counter;
+            
+            unsigned long long ciphertext_len = 0;
+            crypto_aead_xchacha20poly1305_ietf_encrypt(
+                rtp_packet + 12,
+                &ciphertext_len,
+                payload_ptr,
+                payload_len,
+                rtp_packet, // AAD = RTP header (12 bytes)
+                12,
+                nullptr,
+                nonce,
+                m_VoiceConn.m_SecretKey.data()
+            );
+            
+            // Append 4-byte counter at the end
+            memcpy(rtp_packet + 12 + ciphertext_len, &network_counter, 4);
+            
+            sendto(m_VoiceConn.m_UdpSocket, (char*)rtp_packet, 12 + (int)ciphertext_len + 4, 0,
                 (struct sockaddr*)&m_VoiceConn.m_ServerAddr, sizeof(m_VoiceConn.m_ServerAddr));
         }
     }
+    
+    // waveIn cleanup
+    if (hWaveIn) {
+        waveInReset(hWaveIn);
+        for (int i = 0; i < NUM_CAPTURE_BUFFERS; ++i) {
+            waveInUnprepareHeader(hWaveIn, &headers[i], sizeof(WAVEHDR));
+        }
+        waveInClose(hWaveIn);
+    }
+    CloseHandle(hCaptureEvent);
     opus_encoder_destroy(encoder);
+}
+
+// ---------------------------------------------------------------------------
+// UpdateDaveKeys - refresh encryptor + all per-user decryptors after MLS epoch
+// ---------------------------------------------------------------------------
+void DiscordClient::UpdateDaveKeys() {
+    if (!m_VoiceConn.m_DaveSession) return;
+
+    // 1. Update our own encryptor key ratchet
+    if (m_VoiceConn.m_DaveEncryptor) {
+        // We always use "self" key for our own SSRC
+        std::string selfId;
+        { std::lock_guard<std::mutex> lock(m_IdMutex); selfId = m_UserId; }
+
+        DAVEKeyRatchetHandle ratchet = daveSessionGetKeyRatchet(
+            (DAVESessionHandle)m_VoiceConn.m_DaveSession, selfId.c_str());
+        if (ratchet) {
+            daveEncryptorSetKeyRatchet((DAVEEncryptorHandle)m_VoiceConn.m_DaveEncryptor, ratchet);
+            daveKeyRatchetDestroy(ratchet);
+            DebugLog("[DAVE] Encryptor key ratchet updated for self: " + selfId);
+        } else {
+            DebugLog("[DAVE] WARNING: Could not get key ratchet for self");
+        }
+    }
+
+    // 2. Update/create per-user decryptors
+    std::lock_guard<std::mutex> lock(m_VoiceConn.m_VoiceDataMutex);
+    for (const auto& uid : m_VoiceConn.m_RecognizedUserIds) {
+        std::string selfId;
+        { std::lock_guard<std::mutex> idLock(m_IdMutex); selfId = m_UserId; }
+        if (uid == selfId) continue; // skip self
+
+        DAVEKeyRatchetHandle ratchet = daveSessionGetKeyRatchet(
+            (DAVESessionHandle)m_VoiceConn.m_DaveSession, uid.c_str());
+        if (!ratchet) {
+            DebugLog("[DAVE] No ratchet yet for user: " + uid);
+            continue;
+        }
+
+        // Create decryptor if it doesn't exist
+        if (m_VoiceConn.m_UserDecryptors.find(uid) == m_VoiceConn.m_UserDecryptors.end()) {
+            m_VoiceConn.m_UserDecryptors[uid] = daveDecryptorCreate();
+            DebugLog("[DAVE] Created new decryptor for user: " + uid);
+        }
+
+        daveDecryptorTransitionToKeyRatchet(
+            (DAVEDecryptorHandle)m_VoiceConn.m_UserDecryptors[uid], ratchet);
+        daveKeyRatchetDestroy(ratchet);
+        DebugLog("[DAVE] Decryptor key ratchet updated for user: " + uid);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UdpReceiveLoop - receive RTP packets, decrypt transport + DAVE, Opus decode
+// ---------------------------------------------------------------------------
+void DiscordClient::UdpReceiveLoop() {
+    DebugLog("[UDP] UdpReceiveLoop started");
+    std::vector<uint8_t> pkt(4096);
+
+    while (m_VoiceConn.m_Running) {
+        sockaddr_in from{};
+        int fromLen = sizeof(from);
+        int n = recvfrom(m_VoiceConn.m_UdpSocket,
+            (char*)pkt.data(), (int)pkt.size(), 0,
+            (sockaddr*)&from, &fromLen);
+
+        if (n <= 0) {
+            // SO_RCVTIMEO fires a WSAETIMEDOUT here; just loop
+            continue;
+        }
+
+        // ---- Silently drop IP-discovery response (type=2) ----
+        if (n >= 2 && pkt[0] == 0x00 && pkt[1] == 0x02) continue;
+
+        // ---- Minimum valid RTP packet: 12-byte header ----
+        if (n < 12) continue;
+
+        // Parse RTP header
+        uint8_t  rtpV   = (pkt[0] >> 6) & 0x3;
+        if (rtpV != 2) continue;           // not RTP v2
+
+        // Filter out RTCP packets (payload type 72-76 = RTCP over RTP port).
+        // These pass the version check but are not encrypted RTP audio data.
+        uint8_t rtpPT = pkt[1] & 0x7F;
+        if (rtpPT >= 72 && rtpPT <= 76) continue;
+
+        bool     rtpX   = (pkt[0] >> 4) & 0x1;
+        uint8_t  rtpCC  = pkt[0] & 0x0F;
+        uint32_t ssrc   = (pkt[8]<<24)|(pkt[9]<<16)|(pkt[10]<<8)|pkt[11];
+
+        // Skip our own SSRC
+        if (ssrc == m_VoiceConn.m_Ssrc) continue;
+
+        // Skip CSRC list. In _rtpsize modes, the base header (12 + CC*4) serves as AAD.
+        // If the X (extension) bit is set, the 4-byte extension preamble is also AAD,
+        // but the extension payload itself is encrypted (part of the ciphertext).
+        int headerLen = 12 + rtpCC * 4;
+        int aadLen = headerLen;
+        int extPayloadLen = 0;
+        if (rtpX && n >= headerLen + 4) {
+            uint16_t extLen = (pkt[headerLen + 2] << 8) | pkt[headerLen + 3];
+            aadLen += 4;
+            extPayloadLen = extLen * 4;
+        }
+        if (aadLen + extPayloadLen >= n) continue;
+
+        // The ciphertext starts after the AAD.
+        // Minimum packet size includes AAD, encrypted extension payload, ciphertext overhead, and 4-byte counter.
+        if (n < aadLen + extPayloadLen + 4 + (int)crypto_aead_xchacha20poly1305_ietf_ABYTES) continue;
+
+        if (m_VoiceConn.m_SecretKey.size() != 32) continue;
+
+        // Last 4 bytes are the 32-bit nonce counter
+        const uint8_t* rawEnd  = pkt.data() + n;
+        const uint8_t* nonceTag = rawEnd - 4;
+        uint8_t nonce[24] = {0};
+        memcpy(nonce, nonceTag, 4);
+
+        const uint8_t* cipherStart = pkt.data() + aadLen;
+        size_t cipherLen = (size_t)(nonceTag - cipherStart);
+
+        std::vector<uint8_t> plaintext(cipherLen);
+        unsigned long long ptLen = 0;
+
+        int rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
+            plaintext.data(), &ptLen,
+            nullptr,
+            cipherStart, cipherLen,
+            pkt.data(), aadLen,   // AAD = RTP header + optional extension preamble
+            nonce,
+            m_VoiceConn.m_SecretKey.data());
+
+        if (rc != 0) {
+            DebugLog("[UDP] Transport decrypt failed for SSRC=" + std::to_string(ssrc));
+            continue;
+        }
+        plaintext.resize((size_t)ptLen);
+
+        // Strip the decrypted extension payload to get the actual DAVE/Opus payload
+        if (extPayloadLen > (int)plaintext.size()) continue;
+        const uint8_t* davePayloadPtr = plaintext.data() + extPayloadLen;
+        size_t davePayloadLen = plaintext.size() - extPayloadLen;
+
+        // ---- DAVE E2EE decrypt layer ----
+        std::vector<uint8_t> opusData;
+
+        std::string uid;
+        {
+            std::lock_guard<std::mutex> lk(m_VoiceConn.m_VoiceDataMutex);
+            auto it = m_VoiceConn.m_SsrcToUser.find(ssrc);
+            if (it != m_VoiceConn.m_SsrcToUser.end()) uid = it->second;
+        }
+
+        bool daveDecrypted = false;
+        if (!uid.empty() && m_VoiceConn.m_DaveHandshakeComplete) {
+            std::lock_guard<std::mutex> lk(m_VoiceConn.m_VoiceDataMutex);
+            auto dit = m_VoiceConn.m_UserDecryptors.find(uid);
+            if (dit != m_VoiceConn.m_UserDecryptors.end() && dit->second) {
+                size_t maxPt = daveDecryptorGetMaxPlaintextByteSize(
+                    (DAVEDecryptorHandle)dit->second,
+                    DAVE_MEDIA_TYPE_AUDIO, davePayloadLen);
+                opusData.resize(maxPt);
+                size_t written = 0;
+                auto drc = daveDecryptorDecrypt(
+                    (DAVEDecryptorHandle)dit->second,
+                    DAVE_MEDIA_TYPE_AUDIO,
+                    davePayloadPtr, davePayloadLen,
+                    opusData.data(), maxPt, &written);
+                if (drc == DAVE_DECRYPTOR_RESULT_CODE_SUCCESS) {
+                    opusData.resize(written);
+                    daveDecrypted = true;
+                } else {
+                    DebugLog("[DAVE] Decrypt failed for uid=" + uid + " rc=" + std::to_string((int)drc));
+                }
+            }
+        }
+
+        if (!daveDecrypted) {
+            // Either DAVE not active yet (pre-handshake) or no decryptor → treat as raw Opus
+            opusData.assign(davePayloadPtr, davePayloadPtr + davePayloadLen);
+        }
+
+        if (opusData.empty()) continue;
+
+        // ---- Opus decode ----
+        {
+            std::lock_guard<std::mutex> lk(m_VoiceConn.m_VoiceDataMutex);
+
+            // Create decoder if needed
+            if (m_VoiceConn.m_OpusDecoders.find(ssrc) == m_VoiceConn.m_OpusDecoders.end()) {
+                int err = 0;
+                OpusDecoder* dec = opus_decoder_create(48000, 2, &err);
+                if (err == OPUS_OK && dec) {
+                    m_VoiceConn.m_OpusDecoders[ssrc] = dec;
+                    DebugLog("[UDP] Created Opus decoder for SSRC=" + std::to_string(ssrc));
+                }
+            }
+
+            auto decIt = m_VoiceConn.m_OpusDecoders.find(ssrc);
+            if (decIt == m_VoiceConn.m_OpusDecoders.end() || !decIt->second) continue;
+
+            // 960 samples * 2 channels = 1920 shorts (stereo)
+            std::vector<int16_t> pcm(960 * 2);
+            int frames = opus_decode(
+                (OpusDecoder*)decIt->second,
+                opusData.data(), (opus_int32)opusData.size(),
+                pcm.data(), 960, 0);
+
+            if (frames > 0) {
+                auto& queue = m_VoiceConn.m_UserPcmQueues[ssrc];
+                // Cap queue to ~2 seconds of audio to prevent unbounded growth
+                const size_t MAX_QUEUE_SAMPLES = 48000 * 2 * 2; // 2s stereo
+                if (queue.size() < MAX_QUEUE_SAMPLES) {
+                    queue.insert(queue.end(), pcm.begin(), pcm.begin() + frames * 2);
+                }
+            }
+        }
+    }
+    DebugLog("[UDP] UdpReceiveLoop ended");
+}
+
+// ---------------------------------------------------------------------------
+// AudioPlaybackLoop - mix per-user PCM queues and play via waveOut
+// ---------------------------------------------------------------------------
+void DiscordClient::AudioPlaybackLoop() {
+    DebugLog("[PLAYBACK] AudioPlaybackLoop started");
+
+    const int SAMPLE_RATE = 48000;
+    const int CHANNELS    = 2;
+    const int FRAME_SIZE  = 960;   // 20ms at 48kHz
+    const int BUFFER_BYTES = FRAME_SIZE * CHANNELS * sizeof(int16_t); // 3840 bytes
+    const int NUM_BUFFERS  = 4;
+
+    WAVEFORMATEX wfx{};
+    wfx.wFormatTag      = WAVE_FORMAT_PCM;
+    wfx.nChannels       = (WORD)CHANNELS;
+    wfx.nSamplesPerSec  = SAMPLE_RATE;
+    wfx.wBitsPerSample  = 16;
+    wfx.nBlockAlign     = (WORD)(CHANNELS * sizeof(int16_t));
+    wfx.nAvgBytesPerSec = SAMPLE_RATE * wfx.nBlockAlign;
+
+    HANDLE hPlayEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    HWAVEOUT hWaveOut = nullptr;
+
+    UINT outputDeviceIdx = (UINT)m_VoiceConn.m_OutputDevice;
+    if (waveOutOpen(&hWaveOut, outputDeviceIdx, &wfx,
+                    (DWORD_PTR)hPlayEvent, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR) {
+        waveOutOpen(&hWaveOut, WAVE_MAPPER, &wfx,
+                    (DWORD_PTR)hPlayEvent, 0, CALLBACK_EVENT);
+    }
+
+    if (!hWaveOut) {
+        DebugLog("[PLAYBACK] waveOutOpen failed – playback disabled");
+        CloseHandle(hPlayEvent);
+        return;
+    }
+    DebugLog("[PLAYBACK] waveOut opened successfully");
+
+    // Allocate double-buffered waveOut buffers
+    std::vector<WAVEHDR>              waveHdrs(NUM_BUFFERS);
+    std::vector<std::vector<int16_t>> audioBufs(NUM_BUFFERS,
+        std::vector<int16_t>(FRAME_SIZE * CHANNELS, 0));
+
+    for (int i = 0; i < NUM_BUFFERS; ++i) {
+        waveHdrs[i] = {};
+        waveHdrs[i].lpData         = (LPSTR)audioBufs[i].data();
+        waveHdrs[i].dwBufferLength = BUFFER_BYTES;
+        waveOutPrepareHeader(hWaveOut, &waveHdrs[i], sizeof(WAVEHDR));
+        // Pre-fill with silence and queue immediately so waveOut starts smoothly
+        waveOutWrite(hWaveOut, &waveHdrs[i], sizeof(WAVEHDR));
+    }
+
+    while (m_VoiceConn.m_Running) {
+        // Wait for a buffer to become free (or 50ms timeout)
+        WaitForSingleObject(hPlayEvent, 50);
+
+        for (int i = 0; i < NUM_BUFFERS; ++i) {
+            if (!(waveHdrs[i].dwFlags & WHDR_DONE)) continue;
+
+            // Mix all user PCM queues into this buffer
+            std::fill(audioBufs[i].begin(), audioBufs[i].end(), (int16_t)0);
+
+            if (!m_VoiceConn.m_IsDeafened) {
+                std::lock_guard<std::mutex> lk(m_VoiceConn.m_VoiceDataMutex);
+                const int SAMPLES_NEEDED = FRAME_SIZE * CHANNELS;
+
+                for (auto& [ssrc, queue] : m_VoiceConn.m_UserPcmQueues) {
+                    if (queue.empty()) continue;
+
+                    int toDrain = (std::min)((int)queue.size(), SAMPLES_NEEDED);
+                    for (int s = 0; s < toDrain; ++s) {
+                        int32_t mixed = (int32_t)audioBufs[i][s] + (int32_t)queue[s];
+                        // Clamp to int16 range
+                        if (mixed >  32767) mixed =  32767;
+                        if (mixed < -32768) mixed = -32768;
+                        audioBufs[i][s] = (int16_t)mixed;
+                    }
+                    queue.erase(queue.begin(), queue.begin() + toDrain);
+                }
+            }
+
+            // Re-submit the buffer
+            waveHdrs[i].dwFlags      &= ~WHDR_DONE;
+            waveHdrs[i].dwBufferLength = BUFFER_BYTES;
+            waveOutWrite(hWaveOut, &waveHdrs[i], sizeof(WAVEHDR));
+        }
+    }
+
+    // Cleanup
+    waveOutReset(hWaveOut);
+    for (int i = 0; i < NUM_BUFFERS; ++i)
+        waveOutUnprepareHeader(hWaveOut, &waveHdrs[i], sizeof(WAVEHDR));
+    waveOutClose(hWaveOut);
+    CloseHandle(hPlayEvent);
+    DebugLog("[PLAYBACK] AudioPlaybackLoop ended");
 }
 
 void DiscordClient::HeartbeatLoop() {

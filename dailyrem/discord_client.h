@@ -82,6 +82,18 @@ struct VoiceConnection {
     uint16_t     m_DaveVersion = 0;
     bool         m_DaveHandshakeComplete = false;  // NEW: only true after Op 22
     std::vector<std::string> m_RecognizedUserIds;  // NEW: tracked from Op 11/13
+    int          m_VoiceSeqAck = 0;                // For v8 Heartbeat
+
+    // Real voice mappings and playback state
+    std::map<uint32_t, std::string> m_SsrcToUser;
+    std::map<std::string, void*> m_UserDecryptors; // user_id -> DAVEDecryptorHandle
+    std::map<uint32_t, void*> m_OpusDecoders;     // ssrc -> OpusDecoder*
+    std::map<uint32_t, std::vector<int16_t>> m_UserPcmQueues; // ssrc -> decoded pcm
+    std::mutex   m_VoiceDataMutex; // protects voice queues and maps
+    std::mutex   m_VoiceWsSendMutex; // serializes all WinHttp voice WS sends (WinHTTP is not thread-safe)
+    uint32_t     m_TxCounter = 0;
+    std::thread  m_UdpReceiveThread;
+    std::thread  m_PlaybackThread;
 };
 
 struct DiscordMessage {
@@ -197,6 +209,10 @@ private:
     void SendThreadLoop();
     void QueueWsMessage(const std::string& message);
     void AudioCaptureLoop(); // Microphone thread
+    void UdpReceiveLoop();
+    void AudioPlaybackLoop();
+    void UpdateDaveKeys();
+    void ProcessAudioFrame(uint32_t ssrc, const unsigned char* payload, size_t payloadLen);
     void SendIdentify(void* hWebSocket);
     std::string HttpRequest(const std::string& method, const std::string& path, const std::string& body = "");
     void ParseJsonMessage(const nlohmann::json& item, DiscordMessage& dmsg);
