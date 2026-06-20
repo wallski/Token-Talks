@@ -1660,10 +1660,12 @@ void DiscordClient::UdpReceiveLoop() {
 
             if (frames > 0) {
                 auto& queue = m_VoiceConn.m_UserPcmQueues[ssrc];
-                // Cap queue to ~2 seconds of audio to prevent unbounded growth
-                const size_t MAX_QUEUE_SAMPLES = 48000 * 2 * 2; // 2s stereo
-                if (queue.size() < MAX_QUEUE_SAMPLES) {
-                    queue.insert(queue.end(), pcm.begin(), pcm.begin() + frames * 2);
+                // Cap queue to ~1 second of audio to prevent unbounded growth
+                const size_t MAX_QUEUE_SAMPLES = 48000 * 2 * 1; // 1s stereo
+                size_t newSamples = (size_t)(frames * 2);
+                if (queue.size() + newSamples <= MAX_QUEUE_SAMPLES) {
+                    for (int s = 0; s < frames * 2; ++s)
+                        queue.push_back(pcm[s]);
                 }
             }
         }
@@ -1681,7 +1683,7 @@ void DiscordClient::AudioPlaybackLoop() {
     const int CHANNELS    = 2;
     const int FRAME_SIZE  = 960;   // 20ms at 48kHz
     const int BUFFER_BYTES = FRAME_SIZE * CHANNELS * sizeof(int16_t); // 3840 bytes
-    const int NUM_BUFFERS  = 4;
+    const int NUM_BUFFERS  = 8;
 
     WAVEFORMATEX wfx{};
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -1735,19 +1737,21 @@ void DiscordClient::AudioPlaybackLoop() {
             if (!m_VoiceConn.m_IsDeafened) {
                 std::lock_guard<std::mutex> lk(m_VoiceConn.m_VoiceDataMutex);
                 const int SAMPLES_NEEDED = FRAME_SIZE * CHANNELS;
+                float vol = m_VoiceConn.m_OutputVolume;
 
                 for (auto& [ssrc, queue] : m_VoiceConn.m_UserPcmQueues) {
                     if (queue.empty()) continue;
 
                     int toDrain = (std::min)((int)queue.size(), SAMPLES_NEEDED);
                     for (int s = 0; s < toDrain; ++s) {
-                        int32_t mixed = (int32_t)audioBufs[i][s] + (int32_t)queue[s];
+                        int32_t sample = (int32_t)((float)queue.front() * vol);
+                        queue.pop_front();
+                        int32_t mixed = (int32_t)audioBufs[i][s] + sample;
                         // Clamp to int16 range
                         if (mixed >  32767) mixed =  32767;
                         if (mixed < -32768) mixed = -32768;
                         audioBufs[i][s] = (int16_t)mixed;
                     }
-                    queue.erase(queue.begin(), queue.begin() + toDrain);
                 }
             }
 

@@ -10,6 +10,7 @@
 
 #include <string>
 #include <vector>
+#include <deque>
 #include <map>
 #include <functional>
 #include <thread>
@@ -75,6 +76,7 @@ struct VoiceConnection {
     int m_OutputDevice = 0;
     bool m_IsMuted = false;
     bool m_IsDeafened = false;
+    float m_OutputVolume = 1.0f;  // 0.0 = silent, 1.0 = normal, 2.0 = 200%
 
     // DAVE E2EE
     void* m_DaveSession = nullptr;   // DAVESessionHandle
@@ -88,7 +90,7 @@ struct VoiceConnection {
     std::map<uint32_t, std::string> m_SsrcToUser;
     std::map<std::string, void*> m_UserDecryptors; // user_id -> DAVEDecryptorHandle
     std::map<uint32_t, void*> m_OpusDecoders;     // ssrc -> OpusDecoder*
-    std::map<uint32_t, std::vector<int16_t>> m_UserPcmQueues; // ssrc -> decoded pcm
+    std::map<uint32_t, std::deque<int16_t>> m_UserPcmQueues; // ssrc -> decoded pcm
     std::mutex   m_VoiceDataMutex; // protects voice queues and maps
     std::mutex   m_VoiceWsSendMutex; // serializes all WinHttp voice WS sends (WinHTTP is not thread-safe)
     uint32_t     m_TxCounter = 0;

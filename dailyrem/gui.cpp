@@ -888,7 +888,6 @@ void DrawMainApp() {
         
         drawTab(" Appearance", 0);
         drawTab(" Voice & Audio", 1);
-        drawTab(" Privacy & Safety", 2);
         ImGui::EndChild();
         
         ImGui::SameLine(0, 0);
@@ -905,30 +904,8 @@ void DrawMainApp() {
             ImGui::SetWindowFontScale(1.0f);
             ImGui::Dummy({0, 20});
             
-            ImGui::Text("Theme Selection");
-            ImGui::PushItemWidth(300);
-            if (ImGui::Combo("##Theme", &g_Settings.theme, "Blurple Dark\0Midnight\0Ruby\0Light Mode\0Amethyst\0")) {
-                ApplyTheme(g_Settings.theme);
-                SaveSettings();
-            }
-            ImGui::PopItemWidth();
-            
             ImGui::Dummy({0, 10});
             if (ImGui::Checkbox("Show Private / Locked Channels", &g_Settings.show_private_channels)) SaveSettings();
-
-            ImGui::Dummy({0, 20});
-            ImGui::Text("Custom Font (Requires Restart)");
-            ImGui::PushItemWidth(300);
-            ImGui::InputText("##FontPath", g_Settings.font_path, sizeof(g_Settings.font_path));
-            ImGui::PopItemWidth();
-            ImGui::SameLine();
-            if (ImGui::Button("Browse...")) {
-                std::string p = OpenMediaFileDialog();
-                if(!p.empty()){
-                    strncpy_s(g_Settings.font_path, p.c_str(), _TRUNCATE);
-                    SaveSettings();
-                }
-            }
         } 
         else if (selected_tab == 1) {
             ImGui::SetWindowFontScale(1.2f);
@@ -958,27 +935,13 @@ void DrawMainApp() {
                 }
                 ImGui::EndCombo();
             }
-            ImGui::SliderFloat("Output Volume", &g_Settings.output_volume, 0.0f, 2.0f, "%.1fx");
+            if (ImGui::SliderFloat("Output Volume", &g_Settings.output_volume, 0.0f, 2.0f, "%.1fx")) {
+                gc.m_VoiceConn.m_OutputVolume = g_Settings.output_volume;
+                SaveSettings();
+            }
             ImGui::PopItemWidth();
             ImGui::Dummy({0, 10});
             if (ImGui::Button("Refresh Devices")) RefreshAudioDevices();
-        } 
-        else if (selected_tab == 2) {
-            ImGui::SetWindowFontScale(1.2f);
-            ImGui::Text("Privacy & Safety");
-            ImGui::SetWindowFontScale(1.0f);
-            ImGui::Dummy({0, 20});
-            
-            static bool allowDms = true;
-            static bool filterMessages = true;
-            static bool showActivity = true;
-
-            ImGui::Checkbox("Allow Direct Messages from server members", &allowDms);
-            ImGui::TextDisabled(" Disable this to block DMs from non-friends.");
-            ImGui::Dummy(ImVec2(0, 10));
-            ImGui::Checkbox("Filter potentially explicit content in messages", &filterMessages);
-            ImGui::Dummy(ImVec2(0, 10));
-            ImGui::Checkbox("Display current activity as a status message", &showActivity);
         }
         ImGui::EndGroup();
         
@@ -1503,13 +1466,21 @@ int RunGUI() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
     LoadSettings();
-    if (strlen(g_Settings.font_path) > 0) {
-        if (!io.Fonts->AddFontFromFileTTF(g_Settings.font_path, 18.0f)) {
-            io.Fonts->AddFontDefault();
-        }
-    } else {
-        io.Fonts->AddFontDefault();
+    // Load Segoe UI from Windows Fonts (built-in on every Windows install, no download)
+    const char* winFonts[] = {
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        nullptr
+    };
+    bool fontLoaded = false;
+    ImFontConfig cfg;
+    cfg.OversampleH = 3; cfg.OversampleV = 1; cfg.PixelSnapH = true;
+    for (int fi = 0; winFonts[fi] && !fontLoaded; ++fi) {
+        if (io.Fonts->AddFontFromFileTTF(winFonts[fi], 15.0f, &cfg))
+            fontLoaded = true;
     }
+    if (!fontLoaded)
+        io.Fonts->AddFontDefault();
     ApplyTheme(g_Settings.theme);
 
     ImGui_ImplWin32_Init(hwnd);
@@ -1517,6 +1488,7 @@ int RunGUI() {
 
     gc.SetOnMessageCallback(OnDiscordMessage);
     gc.SetOnCallCallback(OnIncomingCall);
+    gc.m_VoiceConn.m_OutputVolume = g_Settings.output_volume;
 
     LoadAccountsGUI();
 
